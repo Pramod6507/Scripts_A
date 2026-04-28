@@ -277,42 +277,42 @@ $result1 = Read-Variable -Parameters @(
         @{
             Name        = "permRead"
             Title       = "Read"
-            Tooltip     = "Checked = Allow, Unchecked = Explicit Deny"
+            Tooltip     = "Checked = Allow"
             Editor      = "check"
             Value       = $true
         },
         @{
             Name        = "permWrite"
             Title       = "Write"
-            Tooltip     = "Checked = Allow, Unchecked = Explicit Deny"
+            Tooltip     = "Checked = Allow"
             Editor      = "check"
             Value       = $true
         },
         @{
             Name        = "permRename"
             Title       = "Rename"
-            Tooltip     = "Checked = Allow, Unchecked = Explicit Deny"
+            Tooltip     = "Checked = Allow"
             Editor      = "check"
             Value       = $true
         },
         @{
             Name        = "permCreate"
             Title       = "Create"
-            Tooltip     = "Checked = Allow, Unchecked = Explicit Deny"
+            Tooltip     = "Checked = Allow"
             Editor      = "check"
             Value       = $false
         },
         @{
             Name        = "permDelete"
             Title       = "Delete"
-            Tooltip     = "Checked = Allow, Unchecked = Explicit Deny"
+            Tooltip     = "Checked = Allow"
             Editor      = "check"
             Value       = $false
         },
         @{
             Name        = "permAdminister"
             Title       = "Administer"
-            Tooltip     = "Checked = Allow, Unchecked = Explicit Deny"
+            Tooltip     = "Checked = Allow"
             Editor      = "check"
             Value       = $false
         },
@@ -325,7 +325,7 @@ $result1 = Read-Variable -Parameters @(
         }
 ) `
 -Title "Configure Permissions" `
--Description "Checked = Allow | Unchecked = Explicit Deny`nPermissions will be applied to all rows in the CSV." `
+-Description "Only checked permissions will be explicitly allowed. Unchecked permissions are simply not set (no explicit deny)." `
 -Width 550 `
 -Height 620 `
 -OkButtonName "Next" `
@@ -375,62 +375,36 @@ if ($validRows.Count -eq 0) {
 # ============================================================
 # 5: Build permission map and confirm
 # ============================================================
-$allPermissions = [ordered]@{
-    "item:read"   = $permRead
-    "item:write"  = $permWrite
-    "item:rename" = $permRename
-    "item:create" = $permCreate
-    "item:delete" = $permDelete
-    "item:admin"  = $permAdminister
-    "item:lock"   = $true
-}
 
-# Media library root permissions applied as two separate rules:
-# - Read: Allow on Item, Deny on Descendants (role can see the root node but not contents)
-# - Write/Rename/Create/Delete/Administer: Deny on both Item and Descendants
+# Only include permissions that are explicitly allowed (true).
+# Permissions not listed here are simply not set - no explicit deny is applied anywhere.
+$allPermissions = [ordered]@{}
+if ($permRead)       { $allPermissions["item:read"]   = $true }
+if ($permWrite)      { $allPermissions["item:write"]  = $true }
+if ($permRename)     { $allPermissions["item:rename"] = $true }
+if ($permCreate)     { $allPermissions["item:create"] = $true }
+if ($permDelete)     { $allPermissions["item:delete"] = $true }
+if ($permAdminister) { $allPermissions["item:admin"]  = $true }
+# Lock is always allowed
+$allPermissions["item:lock"] = $true
+
+# Media library root: Allow Read on the root node so the role can navigate into their folder
 $mediaRootReadItemPermissions = [ordered]@{
     "item:read" = $true
 }
 
-$mediaRootDenyDescendantsPermissions = [ordered]@{
-    "item:read"   = $false
-    "item:write"  = $false
-    "item:rename" = $false
-    "item:create" = $false
-    "item:delete" = $false
-    "item:admin"  = $false
-}
-
-$mediaRootDenyItemPermissions = [ordered]@{
-    "item:write"  = $false
-    "item:rename" = $false
-    "item:create" = $false
-    "item:delete" = $false
-    "item:admin"  = $false
-}
-
 # Ancestor folders in the path to the page media folder: Allow Read only so role can navigate
 $mediaAncestorPermissions = [ordered]@{
-    "item:read"   = $true
-    "item:write"  = $false
-    "item:rename" = $false
-    "item:create" = $false
-    "item:delete" = $false
-    "item:admin"  = $false
+    "item:read" = $true
 }
 
-# Media page folder: Allow Read + Write only - Create is denied so users cannot create new folders
+# Media page folder: Allow Read + Write
 $mediaAllowPermissions = [ordered]@{
-    "item:read"   = $true
-    "item:write"  = $true
-    "item:rename" = $false
-    "item:create" = $false
-    "item:delete" = $false
-    "item:admin"  = $false
+    "item:read"  = $true
+    "item:write" = $true
 }
 
 # Page item: Allow Create on the item only (Entity) so page owner can add datasources
-# This is set separately from $allPermissions so Create Deny on Descendants still applies
 $pageCreatePermissions = [ordered]@{
     "item:create" = $true
 }
@@ -440,60 +414,34 @@ $siteDataAllowPermissions = [ordered]@{
     "item:read"   = $true
     "item:write"  = $true
     "item:create" = $true
-    "item:rename" = $false
-    "item:delete" = $false
-    "item:admin"  = $false
 }
 
 # Ancestor pages: Allow Read only so role can navigate the tree to their page
 $ancestorReadPermissions = [ordered]@{
-    "item:read"   = $true
-    "item:write"  = $false
-    "item:rename" = $false
-    "item:create" = $false
-    "item:delete" = $false
-    "item:admin"  = $false
+    "item:read" = $true
 }
 
-# Site level: Deny Write/Create/Delete/Administer - Rename is NOT denied here
-# so that page-level Allow on Rename can take effect without being blocked site-wide
-$siteLevelDenyPermissions = [ordered]@{
-    "item:read"   = $true
-    "item:write"  = $false
-    "item:create" = $false
-    "item:delete" = $false
-    "item:admin"  = $false
+# Site level: Allow Read only
+$siteLevelPermissions = [ordered]@{
+    "item:read" = $true
 }
 
-# Page Data folder: Allow Write + Create + Delete with descendants (page owner level only)
+# Page Data folder: Allow Read + Write + Create + Delete
 $pageDataPermissions = [ordered]@{
     "item:read"   = $true
     "item:write"  = $true
     "item:create" = $true
-    "item:rename" = $false
     "item:delete" = $true
-    "item:admin"  = $false
 }
 
-# Site data folder + Global data folder: Deny Write + Create (page owner level only)
-$dataFolderDenyPermissions = [ordered]@{
-    "item:read"   = $true
-    "item:write"  = $false
-    "item:create" = $false
-    "item:rename" = $false
-    "item:delete" = $false
-    "item:admin"  = $false
-}
 
-$allowList     = ($allPermissions.GetEnumerator() | Where-Object { $_.Value }      | ForEach-Object { $_.Key }) -join ", "
-$denyList      = ($allPermissions.GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object { $_.Key }) -join ", "
+$allowList     = ($allPermissions.GetEnumerator() | Where-Object { $_.Value } | ForEach-Object { $_.Key }) -join ", "
 $descendantMsg = if ($applyToDescendants) { "Item + All Descendants" } else { "Item Only" }
 
 if (-not $allowList) { $allowList = "(none)" }
-if (-not $denyList)  { $denyList  = "(none)" }
 
 $dryRunMsg  = if ($dryRun) { "YES - no changes will be made" } else { "NO - permissions will be applied" }
-$confirmMsg = "Rows to process : $($validRows.Count)`nSites loaded    : $($sites.Count)`nScope           : $descendantMsg`nAllow           : $allowList`nDeny            : $denyList`nDry Run         : $dryRunMsg`n`nProceed?"
+$confirmMsg = "Rows to process : $($validRows.Count)`nSites loaded    : $($sites.Count)`nScope           : $descendantMsg`nAllow           : $allowList`nDry Run         : $dryRunMsg`n`nProceed?"
 
 $confirm = Show-ModalDialog -Control "ConfirmChoice" `
     -Parameters @{
@@ -519,7 +467,6 @@ $report           = @()
 $totalRows        = $validRows.Count
 $currentRow       = 0
 $processedRoles   = [System.Collections.Generic.HashSet[string]]::new()
-$processedSites   = [System.Collections.Generic.HashSet[string]]::new()
 
 $eventDisabler = New-Object Sitecore.Data.Events.EventDisabler
 
@@ -582,34 +529,7 @@ foreach ($row in $validRows) {
     # Find the parent site by walking up the ancestor chain
     $matchingSite = Get-ParentSite -Item $foundPageItem -Sites $sites
 
-    # Step 1: Deny Read on the site for this role (Descendants only)
-    # This means the role cannot see any pages in this site by default
-    # The page-level Allow in Step 2 overrides this for their specific assigned pages
-    if ($matchingSite) {
-        $siteRoleKey = $matchingSite.ID.ToString() + "|" + $roleName
-        if (-not $processedSites.Contains($siteRoleKey)) {
-            if ($dryRun) {
-                $reportRow.Notes += "Dry run - site-level Deny would be set on: " + $matchingSite.Paths.FullPath + " | "
-            } else {
-                try {
-                    Set-PagePermissions -Item $matchingSite -RoleName $roleName -Permissions $siteLevelDenyPermissions -PropagationType "Descendants"
-                    $processedSites.Add($siteRoleKey) | Out-Null
-                    $reportRow.Notes += "Site deny set on: " + $matchingSite.Name + " | "
-                } catch {
-                    $reportRow.Status = "PERMISSIONS_ERROR"
-                    $reportRow.Notes  = "Site-level deny failed: " + $_.Exception.Message
-                    $report += $reportRow
-                    continue
-                }
-            }
-        } else {
-            $reportRow.Notes += "Site deny already set | "
-        }
-    }
-
-    # Step 2: Allow page-level permissions on the specific page (overrides site deny)
-    # Because the deny is Descendants on the site, and the Allow is Entity on the page item,
-    # the explicit Allow wins for the assigned page only
+    # Set page-level Allow permissions on the specific page
     if ($dryRun) {
         $reportRow.Status = "DRY_RUN"
         $reportRow.Notes  += " | Dry run - page permissions would be set"
@@ -629,7 +549,7 @@ foreach ($row in $validRows) {
     }
 
     if (-not $matchingSite) {
-        $reportRow.Notes += " | No matching _AscensionSite ancestor found - site-level deny skipped."
+        $reportRow.Notes += " | No matching _AscensionSite ancestor found - site-level permissions skipped."
     }
 
     # Set Read Allow on each ancestor of the page so the role can navigate the tree
@@ -666,24 +586,21 @@ foreach ($row in $validRows) {
 
     # Media library permissions + archive restrictions:
     # Applied once per unique role using $processedRoles tracker
-    # Step A - Deny everything on media library root
+    # Step A - Allow Read on media library root so role can navigate to their folder
     # Step B - Restrict archive UI commands in core database
     if (-not $processedRoles.Contains($roleName)) {
         $mediaLibraryItem = Get-Item -Path "master:/sitecore/media library" -ErrorAction SilentlyContinue
         if ($mediaLibraryItem) {
             if ($dryRun) {
-                $reportRow.Notes += " | Media library root: full deny would be set"
+                $reportRow.Notes += " | Media library root: Read Allow would be set"
                 $reportRow.Notes += " | Archive commands: Read deny would be set in core db"
             } else {
                 try {
-                    # Three separate rules to match the required permission pattern:
-                    # Read Allow on item, Deny all on descendants, Deny write ops on item
+                    # Allow Read on media library root so role can navigate to their folder
                     Set-PagePermissions -Item $mediaLibraryItem -RoleName $roleName -Permissions $mediaRootReadItemPermissions -PropagationType "Entity"
-                    Set-PagePermissions -Item $mediaLibraryItem -RoleName $roleName -Permissions $mediaRootDenyDescendantsPermissions -PropagationType "Descendants"
-                    Set-PagePermissions -Item $mediaLibraryItem -RoleName $roleName -Permissions $mediaRootDenyItemPermissions -PropagationType "Entity"
-                    $reportRow.Notes += " | Media library root: permissions set"
+                    $reportRow.Notes += " | Media library root: Read Allow set"
                 } catch {
-                    $reportRow.Notes += " | Media library root deny failed: $($_.Exception.Message)"
+                    $reportRow.Notes += " | Media library root Read failed: $($_.Exception.Message)"
                 }
 
                 # Restrict archive UI commands - hides Archive/Restore from Content Editor ribbon
@@ -732,11 +649,11 @@ foreach ($row in $validRows) {
                 $ancestorPath = Split-Path $ancestorPath -Parent
             }
 
-            # Allow Read/Write/Create on the specific page media folder
+            # Allow Read + Write on the specific page media folder
             try {
                 Set-PagePermissions -Item $mediaFolderItem -RoleName $roleName -Permissions $mediaAllowPermissions -PropagationType "Any"
                 $reportRow.MediaFolder = $mediaFolderSCPath
-                $reportRow.Notes += " | Media folder: Read/Write/Create set"
+                $reportRow.Notes += " | Media folder: Read/Write set"
             } catch {
                 $reportRow.Notes += " | Media folder permissions failed: $($_.Exception.Message)"
             }
@@ -745,17 +662,17 @@ foreach ($row in $validRows) {
         }
     }
 
-    # ---- Page Data folder: Allow Write + Create (page owner level) ----
+    # ---- Page Data folder: Allow Read + Write + Create + Delete ----
     $pageDataPath = ($scPath + "\Page Data")
     $pageDataItem = Get-Item -Path $pageDataPath -ErrorAction SilentlyContinue
 
     if ($pageDataItem) {
         if ($dryRun) {
-            $reportRow.Notes += " | Page Data folder found - Write+Create would be set"
+            $reportRow.Notes += " | Page Data folder found - Read/Write/Create/Delete would be set"
         } else {
             try {
                 Set-PagePermissions -Item $pageDataItem -RoleName $roleName -Permissions $pageDataPermissions -PropagationType "Any"
-                $reportRow.Notes += " | Page Data: Write+Create set"
+                $reportRow.Notes += " | Page Data: Read/Write/Create/Delete set"
             } catch {
                 $reportRow.Notes += " | Page Data permissions failed: $($_.Exception.Message)"
             }
@@ -787,24 +704,7 @@ foreach ($row in $validRows) {
         }
     }
 
-    # ---- Global data folder: Deny Write + Create (page owner level) ----
-    $globalDataPath = "master:\content\Intranet Evolution\DFD\Data"
-    $globalDataItem = Get-Item -Path $globalDataPath -ErrorAction SilentlyContinue
 
-    if ($globalDataItem) {
-        if ($dryRun) {
-            $reportRow.Notes += " | Global Data folder found - Write+Create Deny would be confirmed"
-        } else {
-            try {
-                Set-PagePermissions -Item $globalDataItem -RoleName $roleName -Permissions $dataFolderDenyPermissions -PropagationType "Any"
-                $reportRow.Notes += " | Global Data: Write+Create denied"
-            } catch {
-                $reportRow.Notes += " | Global Data permissions failed: $($_.Exception.Message)"
-            }
-        }
-    } else {
-        $reportRow.Notes += " | Global Data folder not found"
-    }
 
     $report += $reportRow
 }
