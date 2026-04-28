@@ -1,0 +1,845 @@
+# Bulk Page Owner Permissions Script
+# Reads a CSV of page paths and roles, sets permissions, finds the parent site
+# by walking up the item ancestors, creates media library folders, and outputs a report.
+# CSV must have columns matching: "Item path", "Role name", and optionally "author" or "owner"
+
+# ============================================================
+# REUSABLE FUNCTION: Apply permissions to a Sitecore item
+# ============================================================
+function Set-PagePermissions {
+    param(
+        [Sitecore.Data.Items.Item] $Item,
+        [string]                   $RoleName,
+        [hashtable]                $Permissions,
+        [string]                   $PropagationType = "Any"
+    )
+
+    $accessRules = @()
+    foreach ($entry in $Permissions.GetEnumerator()) {
+        $securityPermission = if ($entry.Value) { "AllowAccess" } else { "DenyAccess" }
+        $accessRules += New-ItemAcl `
+            -Identity           $RoleName `
+            -AccessRight        $entry.Key `
+            -PropagationType    $PropagationType `
+            -SecurityPermission $securityPermission
+    }
+
+    $Item | Add-ItemAcl -AccessRules $accessRules -PassThru | Out-Null
+}
+
+
+
+# ============================================================
+# REUSABLE FUNCTION: Walk up ancestors to find the site item
+#    Returns the first ancestor whose template matches _AscensionSite
+# ============================================================
+$SiteNameMappingFieldId  = "{76AC9A68-4039-4C03-A7B2-81C9080C2F13}"
+$AscensionSiteTemplateId = [Sitecore.Data.ID]::Parse("{7F81B515-EB46-43D6-AF06-264740F66AC3}")
+
+function Get-ParentSite {
+    param(
+        [Sitecore.Data.Items.Item] $Item,
+        [System.Collections.Generic.List[object]] $Sites
+    )
+    # Match the page item path against the preloaded $sites list
+    foreach ($site in $Sites) {
+        if ($Item.Paths.FullPath -like ($site.Paths.FullPath + "*")) {
+            return $site
+        }
+    }
+    return $null
+}
+
+
+# ============================================================
+# REUSABLE FUNCTION: Ensure a role has sitecore\Page Owner Base as a member role
+#    Checks first - only assigns if not already a member
+# ============================================================
+$PageOwnerBaseRole       = "sitecore\Page Owner Base"
+$AscensionSiteDataTemplateId = "{88072C0A-6A7D-4992-93FA-F37AE67023AA}"
+
+function Ensure-BaseRole {
+    param([string]$RoleName)
+
+    $role = Get-Role -Identity $RoleName -ErrorAction SilentlyContinue
+
+    if (-not $role) {
+        New-Role -Identity $RoleName
+        # Add $RoleName as a member of Page Owner Base (not the other way around)
+        Add-RoleMember -Identity $PageOwnerBaseRole -Member $RoleName
+        return "CREATED"
+    }
+
+    # Check if $RoleName is already a member of Page Owner Base
+    $existingMembers = Get-RoleMember -Identity $PageOwnerBaseRole -ErrorAction SilentlyContinue
+    $alreadyMember   = $existingMembers | Where-Object { $_.Name -eq $RoleName }
+
+    if ($alreadyMember) {
+        return "ALREADY_MEMBER"
+    }
+
+    # Add $RoleName as a member of Page Owner Base
+    Add-RoleMember -Identity $PageOwnerBaseRole -Member $RoleName
+    return "ADDED"
+}
+
+
+# ============================================================
+# REUSABLE FUNCTION: Restrict archive commands for a role in the core database
+# ============================================================
+# Read-deny permission map for archive command items
+$archiveDenyPermissions = [ordered]@{
+    "item:read" = $false
+}
+
+# Archive command paths in the core database
+$ArchiveCommandPaths = @(
+    "core:/sitecore/content/Applications/Content Editor/Ribbons/Chunks/Schedule",
+    "core:/sitecore/content/Applications/Content Editor/Ribbons/Chunks/Schedule/Archive"
+)
+
+function Set-ArchiveRestrictions {
+    param([string]$RoleName)
+
+    foreach ($archivePath in $ArchiveCommandPaths) {
+        $archiveItem = Get-Item -Path $archivePath -ErrorAction SilentlyContinue
+        if ($archiveItem) {
+            Set-PagePermissions -Item $archiveItem -RoleName $RoleName -Permissions $archiveDenyPermissions -PropagationType "Entity"
+            Write-Host ("[INFO] Archive restricted: " + $archivePath + " for " + $RoleName) -ForegroundColor Gray
+        } else {
+            Write-Host ("[WARN] Archive item not found: " + $archivePath) -ForegroundColor Yellow
+        }
+    }
+}
+
+
+# ============================================================
+# REUSABLE FUNCTION: Restrict Publish Restrictions UI for a role in the core database
+# ============================================================
+$PublishRestrictionsChunkPath  = "core:/sitecore/content/Applications/Content Editor/Ribbons/Chunks/Publish Restrictions"
+$PublishRestrictionsChangePath = "core:/sitecore/content/Applications/Content Editor/Ribbons/Chunks/Publish Restrictions/Change"
+
+# Read-deny permission map for publish restrictions items (same as archive deny)
+$publishRestrictionsDenyPermissions = [ordered]@{
+    "item:read" = $false
+}
+
+function Set-PublishRestrictionsRestrictions {
+    param([string]$RoleName)
+
+    # Restrict both the parent chunk and the Change button item
+    # Denying the chunk hides the entire group from the ribbon
+    # Denying the Change button provides defence in depth if the chunk is ever re-enabled
+    $publishPaths = @(
+        $PublishRestrictionsChunkPath,
+        $PublishRestrictionsChangePath
+    )
+
+    foreach ($publishPath in $publishPaths) {
+        $publishItem = Get-Item -Path $publishPath -ErrorAction SilentlyContinue
+        if ($publishItem) {
+            Set-PagePermissions -Item $publishItem -RoleName $RoleName -Permissions $publishRestrictionsDenyPermissions -PropagationType "Entity"
+            Write-Host ("[INFO] Publish Restrictions restricted: " + $publishPath + " for " + $RoleName) -ForegroundColor Gray
+        } else {
+            Write-Host ("[WARN] Publish Restrictions item not found: " + $publishPath) -ForegroundColor Yellow
+        }
+    }
+}
+
+
+# ============================================================
+# REUSABLE FUNCTION: Ensure a media library folder exists, creating recursively if needed
+# ============================================================
+$MediaLibraryRoot = "master:/sitecore/media library/Project/Intranet Evolution/DFD"
+
+function Ensure-MediaFolder {
+    param([string]$Path)
+
+    # Build list of path segments that need to be created, from deepest to shallowest
+    $pathsToCreate = [System.Collections.Generic.List[string]]::new()
+    $current = $Path
+    while ($current -and -not (Test-Path $current)) {
+        $pathsToCreate.Insert(0, $current)
+        $current = Split-Path $current -Parent
+    }
+
+    # Create each missing segment from shallowest to deepest
+    $lastItem = $null
+    foreach ($p in $pathsToCreate) {
+        $parentPath = Split-Path $p -Parent
+        $folderName = Split-Path $p -Leaf
+        $newFolder  = New-Item -Path $parentPath -Name $folderName `
+                               -ItemType "System/Media/Media folder" `
+                               -ErrorAction SilentlyContinue
+        if ($newFolder) {
+            Write-Host ("[CREATED] " + $p) -ForegroundColor Green
+            $lastItem = $newFolder
+        } else {
+            Write-Host ("[ERR]  Failed to create folder: " + $p) -ForegroundColor Red
+            return $null
+        }
+    }
+
+    if ($lastItem) { return $lastItem }
+    return Get-Item -Path $Path -ErrorAction SilentlyContinue
+}
+
+
+# ============================================================
+# 1: Preload all site items by checking for the SiteNameMapping field
+#    Field ID: {76AC9A68-4039-4C03-A7B2-81C9080C2F13} - present on all _AscensionSite items
+# ============================================================
+Write-Host "Loading sites..." -ForegroundColor Cyan
+
+$db    = [Sitecore.Configuration.Factory]::GetDatabase("master")
+$root  = $db.GetItem("/sitecore/content/Intranet Evolution")
+$sites = [System.Collections.Generic.List[object]]::new()
+
+foreach ($descendant in $root.Axes.GetDescendants()) {
+    # Check if _AscensionSite appears anywhere in this item's template base template chain
+    $isSite = $false
+    foreach ($bt in $descendant.Template.BaseTemplates) {
+        if ($bt.ID.ToString() -eq "{7F81B515-EB46-43D6-AF06-264740F66AC3}") {
+            $isSite = $true
+            break
+        }
+    }
+    if ($isSite) {
+        $sites.Add($descendant)
+    }
+}
+
+if ($sites.Count -eq 0) {
+    Show-Alert "No sites found under /sitecore/content/Intranet Evolution. Please verify the _AscensionSite template name."
+    return
+}
+
+Write-Host ("Found " + $sites.Count + " site(s).") -ForegroundColor Cyan
+
+
+# ============================================================
+# REUSABLE FUNCTION: Read CSV content from a Sitecore media item
+# ============================================================
+function Read-CsvFromMedia {
+    param([object]$MediaItemOrPath)
+
+    $item = if ($MediaItemOrPath -is [Sitecore.Data.Items.Item]) {
+        $MediaItemOrPath
+    } else {
+        Get-Item -Path $MediaItemOrPath -ErrorAction SilentlyContinue
+    }
+
+    if (-not $item) {
+        Show-Alert "Media item not found."
+        return $null
+    }
+
+    $mediaItem = New-Object Sitecore.Data.Items.MediaItem($item)
+    $stream    = $mediaItem.GetMediaStream()
+
+    if (-not $stream) {
+        Show-Alert "Could not read media stream from: $($item.Paths.FullPath)"
+        return $null
+    }
+
+    $reader  = New-Object System.IO.StreamReader($stream, [Text.UTF8Encoding]::UTF8)
+    $csvText = $reader.ReadToEnd()
+    $reader.Close()
+    $stream.Close()
+
+    return ConvertFrom-Csv -InputObject $csvText
+}
+
+
+# ============================================================
+# 2: Dialog - CSV media item picker and permission settings
+# ============================================================
+$result1 = Read-Variable -Parameters @(
+        @{
+            Name       = "csvMediaItem"
+            Title      = "Page Owner CSV"
+            Editor     = "item"
+            Parameters = @{
+                DatabaseName                 = "master"
+                Root                         = "master:/sitecore/media library"
+                IncludeTemplatesForSelection = "File|Unversioned File"
+                ExcludeTemplatesForSelection = "Media folder"
+                Selection                    = "Single"
+            }
+        },
+        @{
+            Name        = "applyToDescendants"
+            Title       = "Apply to Descendants"
+            Tooltip     = "Also apply the permissions to all child items of each page"
+            Editor      = "check"
+            Value       = $true
+        },
+        @{
+            Name        = "permRead"
+            Title       = "Read"
+            Tooltip     = "Checked = Allow, Unchecked = Explicit Deny"
+            Editor      = "check"
+            Value       = $true
+        },
+        @{
+            Name        = "permWrite"
+            Title       = "Write"
+            Tooltip     = "Checked = Allow, Unchecked = Explicit Deny"
+            Editor      = "check"
+            Value       = $true
+        },
+        @{
+            Name        = "permRename"
+            Title       = "Rename"
+            Tooltip     = "Checked = Allow, Unchecked = Explicit Deny"
+            Editor      = "check"
+            Value       = $true
+        },
+        @{
+            Name        = "permCreate"
+            Title       = "Create"
+            Tooltip     = "Checked = Allow, Unchecked = Explicit Deny"
+            Editor      = "check"
+            Value       = $false
+        },
+        @{
+            Name        = "permDelete"
+            Title       = "Delete"
+            Tooltip     = "Checked = Allow, Unchecked = Explicit Deny"
+            Editor      = "check"
+            Value       = $false
+        },
+        @{
+            Name        = "permAdminister"
+            Title       = "Administer"
+            Tooltip     = "Checked = Allow, Unchecked = Explicit Deny"
+            Editor      = "check"
+            Value       = $false
+        },
+        @{
+            Name        = "dryRun"
+            Title       = "Dry Run (preview only - no changes will be made)"
+            Tooltip     = "When checked, the script will validate all rows and show what would happen without applying any permissions or creating any folders"
+            Editor      = "check"
+            Value       = $true
+        }
+) `
+-Title "Configure Permissions" `
+-Description "Checked = Allow | Unchecked = Explicit Deny`nPermissions will be applied to all rows in the CSV." `
+-Width 550 `
+-Height 620 `
+-OkButtonName "Next" `
+-CancelButtonName "Cancel"
+
+if ($result1 -ne "ok") {
+    Show-Alert "Script cancelled by user."
+    return
+}
+
+
+# ============================================================
+# 4: Read CSV from media item and detect columns
+# ============================================================
+if (-not $csvMediaItem) {
+    Show-Alert "No CSV file selected. Script cancelled."
+    return
+}
+
+$csvData = Read-CsvFromMedia $csvMediaItem
+
+if (-not $csvData -or $csvData.Count -eq 0) {
+    Show-Alert "CSV file is empty or could not be read."
+    return
+}
+
+$itemPathColumn = $csvData[0].PSObject.Properties.Name | Where-Object { $_ -like "*Item path*" }
+$roleColumn     = $csvData[0].PSObject.Properties.Name | Where-Object { $_ -like "*Role name*" }
+$ownerColumn    = $csvData[0].PSObject.Properties.Name | Where-Object { $_ -like "*author*" -or $_ -like "*owner*" }
+
+if (-not $itemPathColumn -or -not $roleColumn) {
+    Show-Alert "CSV must contain columns matching 'Item path' and 'Role name'.`nFound: $($csvData[0].PSObject.Properties.Name -join ', ')"
+    return
+}
+
+$validRows = $csvData | Where-Object {
+    -not [string]::IsNullOrWhiteSpace($_.$itemPathColumn) -and
+    -not [string]::IsNullOrWhiteSpace($_.$roleColumn)
+}
+
+if ($validRows.Count -eq 0) {
+    Show-Alert "No valid rows found in CSV."
+    return
+}
+
+
+# ============================================================
+# 5: Build permission map and confirm
+# ============================================================
+$allPermissions = [ordered]@{
+    "item:read"   = $permRead
+    "item:write"  = $permWrite
+    "item:rename" = $permRename
+    "item:create" = $permCreate
+    "item:delete" = $permDelete
+    "item:admin"  = $permAdminister
+    "item:lock"   = $true
+}
+
+# Media library root permissions applied as two separate rules:
+# - Read: Allow on Item, Deny on Descendants (role can see the root node but not contents)
+# - Write/Rename/Create/Delete/Administer: Deny on both Item and Descendants
+$mediaRootReadItemPermissions = [ordered]@{
+    "item:read" = $true
+}
+
+$mediaRootDenyDescendantsPermissions = [ordered]@{
+    "item:read"   = $false
+    "item:write"  = $false
+    "item:rename" = $false
+    "item:create" = $false
+    "item:delete" = $false
+    "item:admin"  = $false
+}
+
+$mediaRootDenyItemPermissions = [ordered]@{
+    "item:write"  = $false
+    "item:rename" = $false
+    "item:create" = $false
+    "item:delete" = $false
+    "item:admin"  = $false
+}
+
+# Ancestor folders in the path to the page media folder: Allow Read only so role can navigate
+$mediaAncestorPermissions = [ordered]@{
+    "item:read"   = $true
+    "item:write"  = $false
+    "item:rename" = $false
+    "item:create" = $false
+    "item:delete" = $false
+    "item:admin"  = $false
+}
+
+# Media page folder: Allow Read + Write only - Create is denied so users cannot create new folders
+$mediaAllowPermissions = [ordered]@{
+    "item:read"   = $true
+    "item:write"  = $true
+    "item:rename" = $false
+    "item:create" = $false
+    "item:delete" = $false
+    "item:admin"  = $false
+}
+
+# Page item: Allow Create on the item only (Entity) so page owner can add datasources
+# This is set separately from $allPermissions so Create Deny on Descendants still applies
+$pageCreatePermissions = [ordered]@{
+    "item:create" = $true
+}
+
+# Ascension Site Data folder: Allow Read + Write + Create for page owners
+$siteDataAllowPermissions = [ordered]@{
+    "item:read"   = $true
+    "item:write"  = $true
+    "item:create" = $true
+    "item:rename" = $false
+    "item:delete" = $false
+    "item:admin"  = $false
+}
+
+# Ancestor pages: Allow Read only so role can navigate the tree to their page
+$ancestorReadPermissions = [ordered]@{
+    "item:read"   = $true
+    "item:write"  = $false
+    "item:rename" = $false
+    "item:create" = $false
+    "item:delete" = $false
+    "item:admin"  = $false
+}
+
+# Site level: Deny Write/Create/Delete/Administer - Rename is NOT denied here
+# so that page-level Allow on Rename can take effect without being blocked site-wide
+$siteLevelDenyPermissions = [ordered]@{
+    "item:read"   = $true
+    "item:write"  = $false
+    "item:create" = $false
+    "item:delete" = $false
+    "item:admin"  = $false
+}
+
+# Page Data folder: Allow Write + Create + Delete with descendants (page owner level only)
+$pageDataPermissions = [ordered]@{
+    "item:read"   = $true
+    "item:write"  = $true
+    "item:create" = $true
+    "item:rename" = $false
+    "item:delete" = $true
+    "item:admin"  = $false
+}
+
+# Site data folder + Global data folder: Deny Write + Create (page owner level only)
+$dataFolderDenyPermissions = [ordered]@{
+    "item:read"   = $true
+    "item:write"  = $false
+    "item:create" = $false
+    "item:rename" = $false
+    "item:delete" = $false
+    "item:admin"  = $false
+}
+
+$allowList     = ($allPermissions.GetEnumerator() | Where-Object { $_.Value }      | ForEach-Object { $_.Key }) -join ", "
+$denyList      = ($allPermissions.GetEnumerator() | Where-Object { -not $_.Value } | ForEach-Object { $_.Key }) -join ", "
+$descendantMsg = if ($applyToDescendants) { "Item + All Descendants" } else { "Item Only" }
+
+if (-not $allowList) { $allowList = "(none)" }
+if (-not $denyList)  { $denyList  = "(none)" }
+
+$dryRunMsg  = if ($dryRun) { "YES - no changes will be made" } else { "NO - permissions will be applied" }
+$confirmMsg = "Rows to process : $($validRows.Count)`nSites loaded    : $($sites.Count)`nScope           : $descendantMsg`nAllow           : $allowList`nDeny            : $denyList`nDry Run         : $dryRunMsg`n`nProceed?"
+
+$confirm = Show-ModalDialog -Control "ConfirmChoice" `
+    -Parameters @{
+        btn_0 = "Yes"
+        btn_1 = "No"
+        te    = $confirmMsg
+        cp    = "Confirm Bulk Page Owner Assignment"
+    } `
+    -Height 220 -Width 700
+
+if ($confirm -ne "btn_0") {
+    Show-Alert "Operation cancelled."
+    return
+}
+
+
+# ============================================================
+# 6: Process each CSV row
+# ============================================================
+$propagationType = if ($applyToDescendants) { "Any" } else { "Entity" }
+
+$report           = @()
+$totalRows        = $validRows.Count
+$currentRow       = 0
+$processedRoles   = [System.Collections.Generic.HashSet[string]]::new()
+$processedSites   = [System.Collections.Generic.HashSet[string]]::new()
+
+$eventDisabler = New-Object Sitecore.Data.Events.EventDisabler
+
+
+
+foreach ($row in $validRows) {
+    $currentRow++
+    Write-Progress -Activity "Bulk Assign Page Owner Permissions" `
+                   -Status ("Row " + $currentRow + " of " + $totalRows + " - " + $row.$roleColumn) `
+                   -PercentComplete (($currentRow / $totalRows) * 100)
+    $itemPath = $row.$itemPathColumn.Trim()
+    $roleName = ($row.$roleColumn.Trim() -replace "[^\x20-\x7E]", "").Trim()
+    $owner    = if ($ownerColumn) { $row.$ownerColumn } else { "" }
+
+    $reportRow = [PSCustomObject]@{
+        ItemPath    = $itemPath
+        Role        = $roleName
+        Owner       = $owner
+        Status      = ""
+        MediaFolder = ""
+        Notes       = ""
+    }
+
+    # Ensure role has sitecore\Page Owner Base as a member role
+    # If role does not exist it will be created automatically
+    if ($dryRun) {
+        $role            = Get-Role -Identity $roleName -ErrorAction SilentlyContinue
+        $existingMembers = if ($role) { Get-RoleMember -Identity $roleName -ErrorAction SilentlyContinue } else { @() }
+        $alreadyMember   = $existingMembers | Where-Object { $_.Name -eq $PageOwnerBaseRole }
+        if (-not $role) {
+            $reportRow.Notes += "Role does not exist - would be created with base role | "
+        } elseif ($alreadyMember) {
+            $reportRow.Notes += "Base role already assigned | "
+        } else {
+            $reportRow.Notes += "Base role would be assigned | "
+        }
+    } else {
+        $baseRoleResult = Ensure-BaseRole -RoleName $roleName
+        $noteMsg = switch ($baseRoleResult) {
+            "CREATED"        { "Role created + base role assigned | " }
+            "ADDED"          { "Base role assigned | " }
+            "ALREADY_MEMBER" { "Base role already set | " }
+            default          { "Base role result: $baseRoleResult | " }
+        }
+        $reportRow.Notes += $noteMsg
+    }
+
+    # Resolve Sitecore item path to SPE provider path
+    $scPath = $itemPath -replace "^/sitecore", "master:"
+    $scPath = $scPath -replace "/", "\"
+    $foundPageItem = Get-Item -Path $scPath -ErrorAction SilentlyContinue
+
+    if (-not $foundPageItem) {
+        $reportRow.Status = "MISSING_PAGE"
+        $reportRow.Notes  = "Item not found at path: $itemPath"
+        $report += $reportRow
+        continue
+    }
+
+    # Find the parent site by walking up the ancestor chain
+    $matchingSite = Get-ParentSite -Item $foundPageItem -Sites $sites
+
+    # Step 1: Deny Read on the site for this role (Descendants only)
+    # This means the role cannot see any pages in this site by default
+    # The page-level Allow in Step 2 overrides this for their specific assigned pages
+    if ($matchingSite) {
+        $siteRoleKey = $matchingSite.ID.ToString() + "|" + $roleName
+        if (-not $processedSites.Contains($siteRoleKey)) {
+            if ($dryRun) {
+                $reportRow.Notes += "Dry run - site-level Deny would be set on: " + $matchingSite.Paths.FullPath + " | "
+            } else {
+                try {
+                    Set-PagePermissions -Item $matchingSite -RoleName $roleName -Permissions $siteLevelDenyPermissions -PropagationType "Descendants"
+                    $processedSites.Add($siteRoleKey) | Out-Null
+                    $reportRow.Notes += "Site deny set on: " + $matchingSite.Name + " | "
+                } catch {
+                    $reportRow.Status = "PERMISSIONS_ERROR"
+                    $reportRow.Notes  = "Site-level deny failed: " + $_.Exception.Message
+                    $report += $reportRow
+                    continue
+                }
+            }
+        } else {
+            $reportRow.Notes += "Site deny already set | "
+        }
+    }
+
+    # Step 2: Allow page-level permissions on the specific page (overrides site deny)
+    # Because the deny is Descendants on the site, and the Allow is Entity on the page item,
+    # the explicit Allow wins for the assigned page only
+    if ($dryRun) {
+        $reportRow.Status = "DRY_RUN"
+        $reportRow.Notes  += " | Dry run - page permissions would be set"
+    } else {
+        try {
+            Set-PagePermissions -Item $foundPageItem -RoleName $roleName -Permissions $allPermissions -PropagationType $propagationType
+            # Also allow Create on the item itself (Entity only) regardless of dialog checkbox
+            Set-PagePermissions -Item $foundPageItem -RoleName $roleName -Permissions $pageCreatePermissions -PropagationType "Entity"
+            $reportRow.Status = "PERMISSIONS_SET"
+            $reportRow.Notes += "Page permissions set | "
+        } catch {
+            $reportRow.Status = "PERMISSIONS_ERROR"
+            $reportRow.Notes  = $_.Exception.Message
+            $report += $reportRow
+            continue
+        }
+    }
+
+    if (-not $matchingSite) {
+        $reportRow.Notes += " | No matching _AscensionSite ancestor found - site-level deny skipped."
+    }
+
+    # Set Read Allow on each ancestor of the page so the role can navigate the tree
+    # Walk up from the page's parent to the sitecore root, setting Read on each item
+    if (-not $dryRun) {
+        $ancestorItem  = $foundPageItem.Parent
+        $ancestorNames = @()
+        while ($ancestorItem -and $ancestorItem.ID -ne [Sitecore.Data.ID]::Parse("{11111111-1111-1111-1111-111111111111}")) {
+            Set-PagePermissions -Item $ancestorItem -RoleName $roleName -Permissions $ancestorReadPermissions -PropagationType "Entity"
+            $ancestorNames += $ancestorItem.Name
+            $ancestorItem = $ancestorItem.Parent
+        }
+        $reportRow.Notes += "Ancestor Read set on: " + ($ancestorNames -join " > ") + " | "
+    } else {
+        $reportRow.Notes += "Dry run - ancestor Read would be set | "
+    }
+
+    # Build media folder path:
+    # /sitecore/media library/Project/Intranet Evolution/DFD/[$matchingSite.name]/[$foundPageItem.Parent.name]/[$foundPageItem.name]
+    $siteName       = $matchingSite.Name
+    $pageParentName = $foundPageItem.Parent.Name
+    $pageName       = $foundPageItem.Name
+
+    # Build media folder path using the page's relative path under the site
+    # e.g. site=mhp, page=/sitecore/content/.../mhp/Ministry Detail Page
+    # -> media folder: MediaLibraryRoot/mhp/Ministry Detail Page
+    $siteFullPath      = $matchingSite.Paths.FullPath
+    # Insert "pages" between the site name and the page path to match the new media library structure:
+    # Before: DFD/[site]/[page]
+    # After:  DFD/[site]/pages/[page]
+    $relativePagePath  = $foundPageItem.Paths.FullPath.Substring($siteFullPath.Length).TrimStart("/")
+    $mediaFolderPath   = "$MediaLibraryRoot/$siteName/pages/$relativePagePath"
+    $mediaFolderSCPath = "/sitecore/media library/Project/Intranet Evolution/DFD/$siteName/pages/$relativePagePath"
+
+    # Media library permissions + archive restrictions:
+    # Applied once per unique role using $processedRoles tracker
+    # Step A - Deny everything on media library root
+    # Step B - Restrict archive UI commands in core database
+    if (-not $processedRoles.Contains($roleName)) {
+        $mediaLibraryItem = Get-Item -Path "master:/sitecore/media library" -ErrorAction SilentlyContinue
+        if ($mediaLibraryItem) {
+            if ($dryRun) {
+                $reportRow.Notes += " | Media library root: full deny would be set"
+                $reportRow.Notes += " | Archive commands: Read deny would be set in core db"
+            } else {
+                try {
+                    # Three separate rules to match the required permission pattern:
+                    # Read Allow on item, Deny all on descendants, Deny write ops on item
+                    Set-PagePermissions -Item $mediaLibraryItem -RoleName $roleName -Permissions $mediaRootReadItemPermissions -PropagationType "Entity"
+                    Set-PagePermissions -Item $mediaLibraryItem -RoleName $roleName -Permissions $mediaRootDenyDescendantsPermissions -PropagationType "Descendants"
+                    Set-PagePermissions -Item $mediaLibraryItem -RoleName $roleName -Permissions $mediaRootDenyItemPermissions -PropagationType "Entity"
+                    $reportRow.Notes += " | Media library root: permissions set"
+                } catch {
+                    $reportRow.Notes += " | Media library root deny failed: $($_.Exception.Message)"
+                }
+
+                # Restrict archive UI commands - hides Archive/Restore from Content Editor ribbon
+                try {
+                    Set-ArchiveRestrictions -RoleName $roleName
+                    $reportRow.Notes += " | Archive commands restricted"
+                } catch {
+                    $reportRow.Notes += " | Archive restriction failed: $($_.Exception.Message)"
+                }
+
+                # Restrict Publish Restrictions UI - hides the Change button from the ribbon
+                # Prevents role from modifying publish restrictions which could unpublish pages
+                try {
+                    Set-PublishRestrictionsRestrictions -RoleName $roleName
+                    $reportRow.Notes += " | Publish Restrictions restricted"
+                } catch {
+                    $reportRow.Notes += " | Publish Restrictions restriction failed: $($_.Exception.Message)"
+                }
+
+                $processedRoles.Add($roleName) | Out-Null
+            }
+        }
+    }
+
+    # Create media folder using Ensure-MediaFolder (recursive, correct media folder type)
+    if ($dryRun) {
+        if (Test-Path $mediaFolderPath) {
+            $reportRow.MediaFolder = $mediaFolderSCPath
+            $reportRow.Notes += " | Media folder already exists"
+        } else {
+            $reportRow.MediaFolder = $mediaFolderSCPath
+            $reportRow.Notes += " | Media folder would be created"
+        }
+    } else {
+        $mediaFolderItem = Ensure-MediaFolder -Path $mediaFolderPath
+
+        if ($mediaFolderItem) {
+            # Allow Read on each ancestor folder so the role can navigate to their folder
+            # but cannot see sibling folders or their contents
+            $ancestorPath = Split-Path $mediaFolderPath -Parent
+            while ($ancestorPath -and $ancestorPath -ne "master:") {
+                $ancestorItem = Get-Item -Path $ancestorPath -ErrorAction SilentlyContinue
+                if ($ancestorItem) {
+                    Set-PagePermissions -Item $ancestorItem -RoleName $roleName -Permissions $mediaAncestorPermissions -PropagationType "Entity"
+                }
+                $ancestorPath = Split-Path $ancestorPath -Parent
+            }
+
+            # Allow Read/Write/Create on the specific page media folder
+            try {
+                Set-PagePermissions -Item $mediaFolderItem -RoleName $roleName -Permissions $mediaAllowPermissions -PropagationType "Any"
+                $reportRow.MediaFolder = $mediaFolderSCPath
+                $reportRow.Notes += " | Media folder: Read/Write/Create set"
+            } catch {
+                $reportRow.Notes += " | Media folder permissions failed: $($_.Exception.Message)"
+            }
+        } else {
+            $reportRow.Notes += " | Media folder creation failed"
+        }
+    }
+
+    # ---- Page Data folder: Allow Write + Create (page owner level) ----
+    $pageDataPath = ($scPath + "\Page Data")
+    $pageDataItem = Get-Item -Path $pageDataPath -ErrorAction SilentlyContinue
+
+    if ($pageDataItem) {
+        if ($dryRun) {
+            $reportRow.Notes += " | Page Data folder found - Write+Create would be set"
+        } else {
+            try {
+                Set-PagePermissions -Item $pageDataItem -RoleName $roleName -Permissions $pageDataPermissions -PropagationType "Any"
+                $reportRow.Notes += " | Page Data: Write+Create set"
+            } catch {
+                $reportRow.Notes += " | Page Data permissions failed: $($_.Exception.Message)"
+            }
+        }
+    } else {
+        $reportRow.Notes += " | Page Data folder not found"
+    }
+
+    # ---- Ascension Site Data folder: Allow Read + Write + Create for page owners ----
+    # Found by Ascension Site Data template ID - name varies per site (e.g. "Saint Thomas Data")
+    if ($matchingSite) {
+        $siteDataItem = $matchingSite.Children | Where-Object {
+            $_.TemplateID.ToString() -eq $AscensionSiteDataTemplateId
+        } | Select-Object -First 1
+
+        if ($siteDataItem) {
+            if ($dryRun) {
+                $reportRow.Notes += " | Site Data folder found - Read/Write/Create would be set on: " + $siteDataItem.Name
+            } else {
+                try {
+                    Set-PagePermissions -Item $siteDataItem -RoleName $roleName -Permissions $siteDataAllowPermissions -PropagationType "Any"
+                    $reportRow.Notes += " | Site Data (" + $siteDataItem.Name + "): Read/Write/Create set"
+                } catch {
+                    $reportRow.Notes += " | Site Data permissions failed: $($_.Exception.Message)"
+                }
+            }
+        } else {
+            $reportRow.Notes += " | Ascension Site Data item not found under site: " + $matchingSite.Name
+        }
+    }
+
+    # ---- Global data folder: Deny Write + Create (page owner level) ----
+    $globalDataPath = "master:\content\Intranet Evolution\DFD\Data"
+    $globalDataItem = Get-Item -Path $globalDataPath -ErrorAction SilentlyContinue
+
+    if ($globalDataItem) {
+        if ($dryRun) {
+            $reportRow.Notes += " | Global Data folder found - Write+Create Deny would be confirmed"
+        } else {
+            try {
+                Set-PagePermissions -Item $globalDataItem -RoleName $roleName -Permissions $dataFolderDenyPermissions -PropagationType "Any"
+                $reportRow.Notes += " | Global Data: Write+Create denied"
+            } catch {
+                $reportRow.Notes += " | Global Data permissions failed: $($_.Exception.Message)"
+            }
+        }
+    } else {
+        $reportRow.Notes += " | Global Data folder not found"
+    }
+
+    $report += $reportRow
+}
+
+
+$eventDisabler.Dispose()
+
+Write-Progress -Activity "Bulk Assign Page Owner Permissions" -Completed
+
+
+# ============================================================
+# 7: Output report via Show-ListView
+# ============================================================
+$reportTitle = if ($dryRun) { "Bulk Page Owner Report (DRY RUN)" } else { "Bulk Page Owner Report" }
+$infoTitle   = if ($dryRun) { "DRY RUN - " + $report.Count + " rows previewed, no changes made" } else { "Results: " + $report.Count + " rows processed" }
+
+$report | Show-ListView `
+    -Property `
+        @{ Label = "Status";       Expression = { $_.Status } },
+        @{ Label = "Item Path";    Expression = { $_.ItemPath } },
+        @{ Label = "Role";         Expression = { $_.Role } },
+        @{ Label = "Owner";        Expression = { $_.Owner } },
+        @{ Label = "Media Folder"; Expression = { $_.MediaFolder } },
+        @{ Label = "Notes";        Expression = { $_.Notes } } `
+    -Title $reportTitle `
+    -InfoTitle $infoTitle `
+    -PageSize 50
+
+$permSet    = ($report | Where-Object { $_.Status -eq "PERMISSIONS_SET" }).Count
+$dryRunRows = ($report | Where-Object { $_.Status -eq "DRY_RUN" }).Count
+$missing    = ($report | Where-Object { $_.Status -eq "MISSING_PAGE" }).Count
+$permErrors = ($report | Where-Object { $_.Status -eq "PERMISSIONS_ERROR" }).Count
+
+if ($dryRun) {
+    Write-Host ("DRY RUN complete. DRY_RUN: " + $dryRunRows + " | MISSING_PAGE: " + $missing) -ForegroundColor Yellow
+} else {
+    Write-Host ("Done. PERMISSIONS_SET: " + $permSet + " | MISSING_PAGE: " + $missing + " | PERMISSIONS_ERROR: " + $permErrors) -ForegroundColor Green
+}
