@@ -1,0 +1,361 @@
+# ============================================================
+# Bulk Role Assignment by Email
+# Creates user accounts if they don't exist, then assigns roles.
+# If a user already exists by email OR by derived username, the existing user is reused.
+# Email format expected: FirstName.LastName@ascension.org
+# ============================================================
+
+function Read-CsvFromMedia {
+    param([object]$MediaItemOrPath)
+
+    $item = if ($MediaItemOrPath -is [Sitecore.Data.Items.Item]) {
+        $MediaItemOrPath
+    } else {
+        Get-Item -Path $MediaItemOrPath -ErrorAction SilentlyContinue
+    }
+
+    if (-not $item) {
+        Show-Alert "Media item not found."
+        return $null
+    }
+
+    $mediaItem = New-Object Sitecore.Data.Items.MediaItem($item)
+    $stream = $null
+    $reader = $null
+
+    try {
+        $stream = $mediaItem.GetMediaStream()
+        if (-not $stream) {
+            Show-Alert "Could not read media stream from: $($item.Paths.FullPath)"
+            return $null
+        }
+
+        $reader  = New-Object System.IO.StreamReader($stream, [System.Text.UTF8Encoding]::new($false))
+        $csvText = $reader.ReadToEnd()
+        return ConvertFrom-Csv -InputObject $csvText
+    }
+    finally {
+        if ($reader) { $reader.Dispose() }
+        if ($stream) { $stream.Dispose() }
+    }
+}
+
+function Normalize-AccountName {
+    param([string]$AccountName)
+
+    if ([string]::IsNullOrWhiteSpace($AccountName)) {
+        return ""
+    }
+
+    return ($AccountName `
+        -replace "[\u200B-\u200D\uFEFF]", "" `
+        -replace "[^\x20-\x7E]", "" `
+    ).Trim()
+}
+
+function Normalize-Email {
+    param([string]$Email)
+
+    if ([string]::IsNullOrWhiteSpace($Email)) {
+        return ""
+    }
+
+    return ($Email `
+        -replace "[\u200B-\u200D\uFEFF]", "" `
+        -replace "[^\x20-\x7E]", "" `
+    ).Trim()
+}
+
+function Build-UserEmailLookup {
+    param([string]$DomainName = "sitecore")
+
+    $lookup = @{}
+    $users  = Get-User -Filter "$DomainName\*" | Where-Object { $_ -ne $null }
+
+    foreach ($user in $users) {
+        try {
+            $profile = Get-UserProfile -Identity $user.Name -ErrorAction SilentlyContinue
+            if ($profile -and -not [string]::IsNullOrWhiteSpace($profile.Email)) {
+                $normalizedEmail = (Normalize-Email $profile.Email).ToLowerInvariant()
+                if (-not $lookup.ContainsKey($normalizedEmail)) {
+                    $lookup[$normalizedEmail] = $user
+                }
+            }
+        }
+        catch {
+            # Skip users with inaccessible profiles
+        }
+    }
+
+    return $lookup
+}
+
+function Get-UsernameFromEmail {
+    param([string]$Email, [string]$DomainName)
+
+    # Username is the full email address, e.g. sitecore\andrew.taylor1@ascension.org
+    return "$DomainName\$((Normalize-Email $Email))"
+}
+
+function New-SitecoreUserFromEmail {
+    param([string]$Email, [string]$DomainName)
+
+    $cleanEmail = Normalize-Email $Email
+    $userName = Get-UsernameFromEmail -Email $cleanEmail -DomainName $DomainName
+
+    # Derive first and last name from the local part of the email
+    $localPart = $cleanEmail.Split("@")[0]
+    $nameParts = $localPart.Split(".")
+    $firstName = if ($nameParts.Count -ge 1) { (Get-Culture).TextInfo.ToTitleCase(($nameParts[0] -replace "[0-9]", "")) } else { $localPart }
+    $lastName  = if ($nameParts.Count -ge 2) { (Get-Culture).TextInfo.ToTitleCase(($nameParts[1] -replace "[0-9]", "")) } else { "" }
+
+    $newUser = New-User -Identity $userName `
+                        -Email $cleanEmail `
+                        -Password ([System.Guid]::NewGuid().ToString() + "!Aa1") `
+                        -Enabled:$true `
+                        -ErrorAction Stop
+
+    # Set profile fields
+    $profile = Get-UserProfile -Identity $userName
+    $profile.Email     = $cleanEmail
+    $profile.FullName  = "$firstName $lastName".Trim()
+    $profile.Save()
+
+    return $newUser
+}
+
+
+# ============================================================
+# Dialog
+# ============================================================
+$dialogParams = @(
+    @{
+        Name       = "csvMediaItem"
+        Title      = "CSV File"
+        Editor     = "item"
+        Parameters = @{
+            DatabaseName                 = "master"
+            Root                         = "master:/sitecore/media library"
+            IncludeTemplatesForSelection = "File|Unversioned File"
+            ExcludeTemplatesForSelection = "Media folder"
+            Selection                    = "Single"
+        }
+    },
+    @{
+        Name       = "domainName"
+        Title      = "User Domain"
+        Tooltip    = "The Sitecore domain to search for and create users in"
+        Editor     = "text"
+        Value      = "sitecore"
+    },
+    @{
+        Name    = "dryRun"
+        Title   = "Dry Run"
+        Tooltip = "Preview only - no changes will be made"
+        Editor  = "check"
+        Value   = $true
+    }
+)
+
+$result = Read-Variable -Parameters $dialogParams `
+    -Title "Assign Roles to Users by Email" `
+    -Description "Select the CSV file from the Media Library. Existing users will be reused; missing users will be created." `
+    -Width 500 `
+    -Height 300 `
+    -OkButtonName "Run" `
+    -CancelButtonName "Cancel"
+
+if ($result -ne "ok") {
+    Show-Alert "Script cancelled."
+    return
+}
+
+if (-not $csvMediaItem) {
+    Show-Alert "No CSV selected."
+    return
+}
+
+
+# ============================================================
+# Read CSV and validate columns
+# ============================================================
+$csvData = Read-CsvFromMedia $csvMediaItem
+
+if (-not $csvData -or $csvData.Count -eq 0) {
+    Show-Alert "CSV file is empty or could not be read."
+    return
+}
+
+$emailColumn = "page author (required)"
+$roleColumn  = "Sitecore Role name"
+$columns     = $csvData[0].PSObject.Properties.Name
+
+$missingColumns = @()
+if ($emailColumn -notin $columns) { $missingColumns += $emailColumn }
+if ($roleColumn  -notin $columns) { $missingColumns += $roleColumn }
+
+if ($missingColumns.Count -gt 0) {
+    Show-Alert "CSV is missing required columns: $($missingColumns -join ', ')"
+    return
+}
+
+
+# ============================================================
+# Build email lookup table once
+# ============================================================
+Write-Progress -Activity "Building user lookup..." -Status "Scanning $domainName domain"
+$userLookup = Build-UserEmailLookup -DomainName $domainName
+Write-Progress -Activity "Building user lookup..." -Completed
+
+
+# ============================================================
+# Process rows
+# ============================================================
+$report     = [System.Collections.Generic.List[object]]::new()
+$totalRows  = $csvData.Count
+$currentRow = 0
+
+foreach ($row in $csvData) {
+    $currentRow++
+    Write-Progress -Activity "Processing CSV" `
+                   -Status "Row $currentRow of $totalRows" `
+                   -PercentComplete (($currentRow / $totalRows) * 100)
+
+    $email    = Normalize-Email $row.$emailColumn
+    $roleName = Normalize-AccountName $row.$roleColumn
+
+    $reportRow = [PSCustomObject]@{
+        Email    = $email
+        UserName = ""
+        Role     = $roleName
+        Status   = ""
+        Notes    = ""
+    }
+
+    # Validate input
+    if ([string]::IsNullOrWhiteSpace($email) -or [string]::IsNullOrWhiteSpace($roleName)) {
+        $reportRow.Status = "SKIPPED"
+        $reportRow.Notes  = "Missing email or role"
+        $report.Add($reportRow)
+        continue
+    }
+
+    # Validate role exists
+    try {
+        $role = Get-Role -Identity $roleName -ErrorAction SilentlyContinue
+    } catch {
+        $role = $null
+        $reportRow.Status = "ROLE_ERROR"
+        $reportRow.Notes  = "Invalid role name after cleanup: '$roleName'. Error: $($_.Exception.Message)"
+        $report.Add($reportRow)
+        continue
+    }
+
+    if (-not $role) {
+        $reportRow.Status = "ROLE_NOT_FOUND"
+        $reportRow.Notes  = "Role '$roleName' does not exist"
+        $report.Add($reportRow)
+        continue
+    }
+
+    # Look up existing user by email first
+    $normalizedEmail = $email.Trim().ToLowerInvariant()
+    $user = $userLookup[$normalizedEmail]
+
+    # If email lookup fails, check whether the derived username already exists.
+    # This prevents duplicate-create attempts when the profile email is missing or different.
+    $derivedUsername = Get-UsernameFromEmail -Email $email -DomainName $domainName
+    if (-not $user) {
+        $user = Get-User -Identity $derivedUsername -ErrorAction SilentlyContinue
+        if ($user) {
+            $reportRow.Notes += "Existing user found by username: $derivedUsername | "
+            $userLookup[$normalizedEmail] = $user
+        }
+    }
+
+    if (-not $user) {
+        # User not found - create account from email
+        if ($dryRun) {
+            $reportRow.UserName = $derivedUsername
+            $reportRow.Status   = "DRY_RUN"
+            $reportRow.Notes    = "User does not exist - would be created as: $derivedUsername; role would be assigned"
+            $report.Add($reportRow)
+            continue
+        }
+
+        try {
+            $user = New-SitecoreUserFromEmail -Email $email -DomainName $domainName
+            $reportRow.Notes += "User created: $($user.Name) | "
+            # Add to lookup so duplicate emails in CSV don't create twice
+            $userLookup[$normalizedEmail] = $user
+        } catch {
+            $reportRow.Status = "ERROR"
+            $reportRow.Notes  = "Failed to create user: $($_.Exception.Message)"
+            $report.Add($reportRow)
+            continue
+        }
+    }
+
+    $reportRow.UserName = $user.Name
+
+    # Check existing role membership
+    $alreadyInRole = Test-Account -Identity $user.Name -AccountType User -Role $roleName
+    if ($alreadyInRole) {
+        $reportRow.Status = "ALREADY_IN_ROLE"
+        $reportRow.Notes += "User already has this role"
+        $report.Add($reportRow)
+        continue
+    }
+
+    # Assign role or preview
+    if ($dryRun) {
+        $reportRow.Status = "DRY_RUN"
+        $reportRow.Notes += "Role would be assigned to existing user"
+    } else {
+        try {
+            Add-RoleMember -Identity $roleName -Member $user.Name
+            $reportRow.Status = "ASSIGNED"
+            $reportRow.Notes += "Role assigned successfully"
+        } catch {
+            $reportRow.Status = "ERROR"
+            $reportRow.Notes  = $_.Exception.Message
+        }
+    }
+
+    $report.Add($reportRow)
+}
+
+Write-Progress -Activity "Processing CSV" -Completed
+
+
+# ============================================================
+# Output report
+# ============================================================
+$assigned   = ($report | Where-Object { $_.Status -eq "ASSIGNED" }).Count
+$created    = ($report | Where-Object { $_.Notes  -like "*User created*" }).Count
+$alreadySet = ($report | Where-Object { $_.Status -eq "ALREADY_IN_ROLE" }).Count
+$roleErrors = ($report | Where-Object { $_.Status -eq "ROLE_ERROR" }).Count
+$notFound   = ($report | Where-Object { $_.Status -eq "ROLE_NOT_FOUND" }).Count
+$errors     = ($report | Where-Object { $_.Status -eq "ERROR" }).Count
+$skipped    = ($report | Where-Object { $_.Status -eq "SKIPPED" }).Count
+
+$title     = if ($dryRun) { "Bulk Role Assignment Report (DRY RUN)" } else { "Bulk Role Assignment Report" }
+$infoTitle = if ($dryRun) { "Preview only - no changes made" } else { "Assigned: $assigned | Created: $created | Already in role: $alreadySet | Role not found: $notFound | Role errors: $roleErrors | Errors: $errors | Skipped: $skipped" }
+
+$report | Show-ListView `
+    -Property `
+        @{ Label = "Email";  Expression = { $_.Email } },
+        @{ Label = "User";   Expression = { $_.UserName } },
+        @{ Label = "Role";   Expression = { $_.Role } },
+        @{ Label = "Status"; Expression = { $_.Status } },
+        @{ Label = "Notes";  Expression = { $_.Notes } } `
+    -Title $title `
+    -InfoTitle $infoTitle `
+    -InfoDescription "Processed $($report.Count) rows" `
+    -PageSize 50
+
+if ($dryRun) {
+    Write-Host "DRY RUN complete. $($report.Count) rows previewed." -ForegroundColor Yellow
+} else {
+    Write-Host ("Done. Assigned: " + $assigned + " | Created: " + $created + " | Already in role: " + $alreadySet + " | Role not found: " + $notFound + " | Role errors: " + $roleErrors + " | Errors: " + $errors) -ForegroundColor Green
+}
