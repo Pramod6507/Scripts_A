@@ -32,6 +32,16 @@ function Add-PendingRules {
         [string]                   $SecurityPermission = "AllowAccess"
     )
 
+    # Dry-run guard: skip ACL object creation entirely.
+    # Ensure-BaseRole is not called during dry-run, so a role referenced in the CSV
+    # may not yet exist in the security DB. New-ItemAcl requires the role to exist
+    # and would otherwise throw "Cannot find an account with identity ...".
+    # Phase 1 row notes still record what *would* be queued; the Phase 2 preview
+    # under dry-run reflects only items that already had rules to add for known roles.
+    if ($dryRun) {
+        return
+    }
+
     $newRules = @()
     foreach ($entry in $Permissions.GetEnumerator()) {
         # Only $true values produce rules; $false is treated as no change.
