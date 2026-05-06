@@ -1,8 +1,12 @@
 # ============================================================
 # Bulk Role Assignment by Email
-# Creates user accounts if they don't exist, then assigns roles.
-# If a user already exists by email OR by derived username, the existing user is reused.
-# Email format expected: FirstName.LastName@ascension.org
+# Reads a CSV with email + role columns. For each row:
+#   - Constructs username as "sitecore\<email>" (matches the existing convention)
+#   - Creates the user if they don't exist
+#   - Adds them as a member of the role
+#
+# This script does NOT rely on profile email lookups - the username is
+# derived directly from the CSV email, so we always know what to check for.
 # ============================================================
 
 function Read-CsvFromMedia {
@@ -40,85 +44,39 @@ function Read-CsvFromMedia {
     }
 }
 
-function Normalize-AccountName {
-    param([string]$AccountName)
-
-    if ([string]::IsNullOrWhiteSpace($AccountName)) {
-        return ""
-    }
-
-    return ($AccountName `
-        -replace "[\u200B-\u200D\uFEFF]", "" `
-        -replace "[^\x20-\x7E]", "" `
-    ).Trim()
-}
-
-function Normalize-Email {
-    param([string]$Email)
-
-    if ([string]::IsNullOrWhiteSpace($Email)) {
-        return ""
-    }
-
-    return ($Email `
-        -replace "[\u200B-\u200D\uFEFF]", "" `
-        -replace "[^\x20-\x7E]", "" `
-    ).Trim()
-}
-
-function Build-UserEmailLookup {
-    param([string]$DomainName = "sitecore")
-
-    $lookup = @{}
-    $users  = Get-User -Filter "$DomainName\*" | Where-Object { $_ -ne $null }
-
-    foreach ($user in $users) {
-        try {
-            $profile = Get-UserProfile -Identity $user.Name -ErrorAction SilentlyContinue
-            if ($profile -and -not [string]::IsNullOrWhiteSpace($profile.Email)) {
-                $normalizedEmail = (Normalize-Email $profile.Email).ToLowerInvariant()
-                if (-not $lookup.ContainsKey($normalizedEmail)) {
-                    $lookup[$normalizedEmail] = $user
-                }
-            }
-        }
-        catch {
-            # Skip users with inaccessible profiles
-        }
-    }
-
-    return $lookup
-}
-
 function Get-UsernameFromEmail {
     param([string]$Email, [string]$DomainName)
-
-    # Username is the full email address, e.g. sitecore\andrew.taylor1@ascension.org
-    return "$DomainName\$((Normalize-Email $Email))"
+    # Username convention in this environment: domain\<full email>
+    # e.g. sitecore\ashley.gillis1@ascension.org
+    return "$DomainName\$($Email.Trim())"
 }
 
 function New-SitecoreUserFromEmail {
     param([string]$Email, [string]$DomainName)
 
-    $cleanEmail = Normalize-Email $Email
-    $userName = Get-UsernameFromEmail -Email $cleanEmail -DomainName $DomainName
+    $userName = Get-UsernameFromEmail -Email $Email -DomainName $DomainName
 
-    # Derive first and last name from the local part of the email
-    $localPart = $cleanEmail.Split("@")[0]
+    # Derive first/last name from the local part of the email for the profile.
+    # Best-effort - users with non-standard emails may need their profile fixed manually.
+    $localPart = $Email.Trim().Split("@")[0]
     $nameParts = $localPart.Split(".")
     $firstName = if ($nameParts.Count -ge 1) { (Get-Culture).TextInfo.ToTitleCase(($nameParts[0] -replace "[0-9]", "")) } else { $localPart }
     $lastName  = if ($nameParts.Count -ge 2) { (Get-Culture).TextInfo.ToTitleCase(($nameParts[1] -replace "[0-9]", "")) } else { "" }
 
+    # Random GUID password - not used for login because this environment is SSO/SAML federated
+    # Note: -Enabled parameter is not present in all SPE versions, so we set Enabled via property assignment after creation.
     $newUser = New-User -Identity $userName `
-                        -Email $cleanEmail `
+                        -Email $Email `
                         -Password ([System.Guid]::NewGuid().ToString() + "!Aa1") `
-                        -Enabled:$true `
                         -ErrorAction Stop
 
-    # Set profile fields
+    # Enable the account
+    $newUser.Enabled = $true
+
+    # Set profile fields - useful for any tools that rely on profile email later
     $profile = Get-UserProfile -Identity $userName
-    $profile.Email     = $cleanEmail
-    $profile.FullName  = "$firstName $lastName".Trim()
+    $profile.Email    = $Email
+    $profile.FullName = "$firstName $lastName".Trim()
     $profile.Save()
 
     return $newUser
@@ -142,11 +100,11 @@ $dialogParams = @(
         }
     },
     @{
-        Name       = "domainName"
-        Title      = "User Domain"
-        Tooltip    = "The Sitecore domain to search for and create users in"
-        Editor     = "text"
-        Value      = "sitecore"
+        Name    = "domainName"
+        Title   = "User Domain"
+        Tooltip = "The Sitecore domain to create users in"
+        Editor  = "text"
+        Value   = "sitecore"
     },
     @{
         Name    = "dryRun"
@@ -159,7 +117,7 @@ $dialogParams = @(
 
 $result = Read-Variable -Parameters $dialogParams `
     -Title "Assign Roles to Users by Email" `
-    -Description "Select the CSV file from the Media Library. Existing users will be reused; missing users will be created." `
+    -Description "Select the CSV file from the Media Library. Users will be created if they do not exist." `
     -Width 500 `
     -Height 300 `
     -OkButtonName "Run" `
@@ -174,6 +132,15 @@ if (-not $csvMediaItem) {
     Show-Alert "No CSV selected."
     return
 }
+
+# Defensive: in some SPE configurations Read-Variable values don't bind cleanly
+# to script scope. If $dryRun ends up $null we treat it as if dry-run is on,
+# rather than risk silent live writes. This is fail-safe behavior.
+if ($null -eq $dryRun) {
+    Show-Alert "Dry Run setting could not be read from the dialog. Aborting to be safe."
+    return
+}
+$dryRun = [bool]$dryRun
 
 
 # ============================================================
@@ -201,14 +168,6 @@ if ($missingColumns.Count -gt 0) {
 
 
 # ============================================================
-# Build email lookup table once
-# ============================================================
-Write-Progress -Activity "Building user lookup..." -Status "Scanning $domainName domain"
-$userLookup = Build-UserEmailLookup -DomainName $domainName
-Write-Progress -Activity "Building user lookup..." -Completed
-
-
-# ============================================================
 # Process rows
 # ============================================================
 $report     = [System.Collections.Generic.List[object]]::new()
@@ -221,8 +180,8 @@ foreach ($row in $csvData) {
                    -Status "Row $currentRow of $totalRows" `
                    -PercentComplete (($currentRow / $totalRows) * 100)
 
-    $email    = Normalize-Email $row.$emailColumn
-    $roleName = Normalize-AccountName $row.$roleColumn
+    $email    = $row.$emailColumn
+    $roleName = $row.$roleColumn
 
     $reportRow = [PSCustomObject]@{
         Email    = $email
@@ -241,16 +200,7 @@ foreach ($row in $csvData) {
     }
 
     # Validate role exists
-    try {
-        $role = Get-Role -Identity $roleName -ErrorAction SilentlyContinue
-    } catch {
-        $role = $null
-        $reportRow.Status = "ROLE_ERROR"
-        $reportRow.Notes  = "Invalid role name after cleanup: '$roleName'. Error: $($_.Exception.Message)"
-        $report.Add($reportRow)
-        continue
-    }
-
+    $role = Get-Role -Identity $roleName -ErrorAction SilentlyContinue
     if (-not $role) {
         $reportRow.Status = "ROLE_NOT_FOUND"
         $reportRow.Notes  = "Role '$roleName' does not exist"
@@ -258,36 +208,25 @@ foreach ($row in $csvData) {
         continue
     }
 
-    # Look up existing user by email first
-    $normalizedEmail = $email.Trim().ToLowerInvariant()
-    $user = $userLookup[$normalizedEmail]
+    # Build the username deterministically and look it up directly.
+    # Convention here: sitecore\<email>, e.g. sitecore\ashley.gillis1@ascension.org
+    $userName           = Get-UsernameFromEmail -Email $email -DomainName $domainName
+    $reportRow.UserName = $userName
 
-    # If email lookup fails, check whether the derived username already exists.
-    # This prevents duplicate-create attempts when the profile email is missing or different.
-    $derivedUsername = Get-UsernameFromEmail -Email $email -DomainName $domainName
-    if (-not $user) {
-        $user = Get-User -Identity $derivedUsername -ErrorAction SilentlyContinue
-        if ($user) {
-            $reportRow.Notes += "Existing user found by username: $derivedUsername | "
-            $userLookup[$normalizedEmail] = $user
-        }
-    }
+    $user = Get-User -Identity $userName -ErrorAction SilentlyContinue
 
     if (-not $user) {
-        # User not found - create account from email
+        # User doesn't exist - create them (or preview)
         if ($dryRun) {
-            $reportRow.UserName = $derivedUsername
-            $reportRow.Status   = "DRY_RUN"
-            $reportRow.Notes    = "User does not exist - would be created as: $derivedUsername; role would be assigned"
+            $reportRow.Status = "DRY_RUN"
+            $reportRow.Notes  = "User does not exist - would be created and assigned to role"
             $report.Add($reportRow)
             continue
         }
 
         try {
             $user = New-SitecoreUserFromEmail -Email $email -DomainName $domainName
-            $reportRow.Notes += "User created: $($user.Name) | "
-            # Add to lookup so duplicate emails in CSV don't create twice
-            $userLookup[$normalizedEmail] = $user
+            $reportRow.Notes += "User created | "
         } catch {
             $reportRow.Status = "ERROR"
             $reportRow.Notes  = "Failed to create user: $($_.Exception.Message)"
@@ -296,10 +235,19 @@ foreach ($row in $csvData) {
         }
     }
 
-    $reportRow.UserName = $user.Name
-
-    # Check existing role membership
-    $alreadyInRole = Test-Account -Identity $user.Name -AccountType User -Role $roleName
+    # Check existing role membership.
+    # Using Get-RoleMember instead of Test-Account because the -Role parameter
+    # of Test-Account is not present in all SPE versions.
+    $existingMembers = Get-RoleMember -Identity $roleName -ErrorAction SilentlyContinue
+    $alreadyInRole   = $false
+    if ($existingMembers) {
+        foreach ($m in $existingMembers) {
+            if ($m.Name -ieq $userName) {
+                $alreadyInRole = $true
+                break
+            }
+        }
+    }
     if ($alreadyInRole) {
         $reportRow.Status = "ALREADY_IN_ROLE"
         $reportRow.Notes += "User already has this role"
@@ -310,15 +258,16 @@ foreach ($row in $csvData) {
     # Assign role or preview
     if ($dryRun) {
         $reportRow.Status = "DRY_RUN"
-        $reportRow.Notes += "Role would be assigned to existing user"
+        $reportRow.Notes += "Role would be assigned"
     } else {
         try {
-            Add-RoleMember -Identity $roleName -Member $user.Name
+            Add-RoleMember -Identity $roleName -Members $userName
             $reportRow.Status = "ASSIGNED"
-            $reportRow.Notes += "Role assigned successfully"
+            $reportRow.Notes += "Role assigned"
         } catch {
+            # Use += so a prior "User created" note isn't lost when assignment fails.
             $reportRow.Status = "ERROR"
-            $reportRow.Notes  = $_.Exception.Message
+            $reportRow.Notes += "Role assignment failed: " + $_.Exception.Message
         }
     }
 
@@ -331,16 +280,19 @@ Write-Progress -Activity "Processing CSV" -Completed
 # ============================================================
 # Output report
 # ============================================================
-$assigned   = ($report | Where-Object { $_.Status -eq "ASSIGNED" }).Count
-$created    = ($report | Where-Object { $_.Notes  -like "*User created*" }).Count
-$alreadySet = ($report | Where-Object { $_.Status -eq "ALREADY_IN_ROLE" }).Count
-$roleErrors = ($report | Where-Object { $_.Status -eq "ROLE_ERROR" }).Count
-$notFound   = ($report | Where-Object { $_.Status -eq "ROLE_NOT_FOUND" }).Count
-$errors     = ($report | Where-Object { $_.Status -eq "ERROR" }).Count
-$skipped    = ($report | Where-Object { $_.Status -eq "SKIPPED" }).Count
+$assigned     = ($report | Where-Object { $_.Status -eq "ASSIGNED"        }).Count
+$created      = ($report | Where-Object { $_.Notes  -like "*User created*" }).Count
+$alreadySet   = ($report | Where-Object { $_.Status -eq "ALREADY_IN_ROLE" }).Count
+$roleNotFound = ($report | Where-Object { $_.Status -eq "ROLE_NOT_FOUND"  }).Count
+$errors       = ($report | Where-Object { $_.Status -eq "ERROR"           }).Count
+$skipped      = ($report | Where-Object { $_.Status -eq "SKIPPED"         }).Count
 
 $title     = if ($dryRun) { "Bulk Role Assignment Report (DRY RUN)" } else { "Bulk Role Assignment Report" }
-$infoTitle = if ($dryRun) { "Preview only - no changes made" } else { "Assigned: $assigned | Created: $created | Already in role: $alreadySet | Role not found: $notFound | Role errors: $roleErrors | Errors: $errors | Skipped: $skipped" }
+$infoTitle = if ($dryRun) {
+    "Preview only - no changes made"
+} else {
+    "Assigned: $assigned | Created: $created | Already in role: $alreadySet | Role not found: $roleNotFound | Errors: $errors | Skipped: $skipped"
+}
 
 $report | Show-ListView `
     -Property `
@@ -357,5 +309,5 @@ $report | Show-ListView `
 if ($dryRun) {
     Write-Host "DRY RUN complete. $($report.Count) rows previewed." -ForegroundColor Yellow
 } else {
-    Write-Host ("Done. Assigned: " + $assigned + " | Created: " + $created + " | Already in role: " + $alreadySet + " | Role not found: " + $notFound + " | Role errors: " + $roleErrors + " | Errors: " + $errors) -ForegroundColor Green
+    Write-Host ("Done. Assigned: " + $assigned + " | Created: " + $created + " | Already in role: " + $alreadySet + " | Errors: " + $errors) -ForegroundColor Green
 }
