@@ -1,0 +1,633 @@
+# Bulk Site Owner Permissions Script
+# Reads a CSV of (microsite path, role) pairs and grants the role full edit
+# permissions on the microsite, its Site Data folder, and its media library folder.
+#
+# DESIGN: TWO-PHASE WRITE (mirrors BulkPageOwnerPermissions.ps1)
+# Phase 1 (row loop): queue ACL rules in memory, keyed by item path. No DB writes happen.
+# Phase 2 (flush):    for each unique item, do ONE Get-Item + Get-ItemAcl + Set-ItemAcl.
+#
+# DENY POLICY:
+# By default, NO Deny rules are written. The "Restrict ribbon UI" checkbox in the
+# dialog (default OFF) optionally writes the same Archive + Publish Restrictions
+# denies as the page-owner script.
+#
+# CSV must have columns matching: "Item path", "Role name", and optionally "author" or "owner"
+
+# ============================================================
+# QUEUE STATE - same pattern as page-owner script.
+#   $aclQueue[key] = list of ACL rule objects to apply to the item
+#   $aclItems[key] = { Database, Path } so we can fetch the item correctly
+# Key format: "database:fullpath"
+# ============================================================
+$aclQueue = @{}
+$aclItems = @{}
+
+function Add-PendingRules {
+    param(
+        [Sitecore.Data.Items.Item] $Item,
+        [string]                   $RoleName,
+        [hashtable]                $Permissions,
+        [string]                   $PropagationType = "Any",
+        [string]                   $SecurityPermission = "AllowAccess"
+    )
+
+    # Dry-run guard: skip ACL object creation entirely.
+    # Ensure-SiteOwnerBaseRole is not called during dry-run, so a role referenced in the CSV
+    # may not yet exist in the security DB. New-ItemAcl requires the role to exist.
+    if ($dryRun) {
+        return
+    }
+
+    $newRules = @()
+    foreach ($entry in $Permissions.GetEnumerator()) {
+        if (-not $entry.Value) {
+            continue
+        }
+
+        $newRules += New-ItemAcl `
+            -Identity           $RoleName `
+            -AccessRight        $entry.Key `
+            -PropagationType    $PropagationType `
+            -SecurityPermission $SecurityPermission
+    }
+
+    if ($newRules.Count -eq 0) {
+        return
+    }
+
+    $key = $Item.Database.Name + ":" + $Item.Paths.FullPath
+
+    if (-not $aclQueue.ContainsKey($key)) {
+        $aclQueue[$key] = [System.Collections.Generic.List[object]]::new()
+        $aclItems[$key] = @{
+            Database = $Item.Database.Name
+            Path     = $Item.Paths.FullPath
+        }
+    }
+
+    foreach ($r in $newRules) {
+        $aclQueue[$key].Add($r) | Out-Null
+    }
+}
+
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+$AscensionSiteTemplateId     = "{7F81B515-EB46-43D6-AF06-264740F66AC3}"
+$AscensionSiteDataTemplateId = "{88072C0A-6A7D-4992-93FA-F37AE67023AA}"
+
+# NEW base role for site owners - distinct from sitecore\Page Owner Base.
+$SiteOwnerBaseRole = "sitecore\Site Owner Base"
+
+# Media library root for the project. Site owners get the [site] folder under here.
+$MediaLibraryRoot = "master:/sitecore/media library/Project/Intranet Evolution/DFD"
+
+# Stop bound for the content-tree ancestor walk. Walk goes from microsite parent
+# up to but NOT including this path. Permissions on Home and above must be set
+# manually on the base role.
+$homeContentPath = "/sitecore/content/Intranet Evolution/DFD/Home"
+
+
+# ============================================================
+# UTIL: check whether an item is an _AscensionSite (any base template ancestor)
+# ============================================================
+function Test-IsAscensionSite {
+    param([Sitecore.Data.Items.Item] $Item)
+
+    if (-not $Item) { return $false }
+
+    foreach ($bt in $Item.Template.BaseTemplates) {
+        if ($bt.ID.ToString() -eq $AscensionSiteTemplateId) {
+            return $true
+        }
+    }
+    return $false
+}
+
+
+# ============================================================
+# Ensure a role exists and is a member of sitecore\Site Owner Base.
+# Creates the base role itself if it doesn't exist (first run) so the
+# script is self-bootstrapping.
+# ============================================================
+function Ensure-SiteOwnerBaseRole {
+    param([string]$RoleName)
+
+    # Make sure the base role itself exists. Create on first use if missing.
+    $baseRole = Get-Role -Identity $SiteOwnerBaseRole -ErrorAction SilentlyContinue
+    if (-not $baseRole) {
+        New-Role -Identity $SiteOwnerBaseRole
+        Write-Host ("[INFO] Created base role: " + $SiteOwnerBaseRole) -ForegroundColor Cyan
+    }
+
+    $role = Get-Role -Identity $RoleName -ErrorAction SilentlyContinue
+
+    if (-not $role) {
+        New-Role -Identity $RoleName
+        Add-RoleMember -Identity $SiteOwnerBaseRole -Member $RoleName
+        return "CREATED"
+    }
+
+    $existingMembers = Get-RoleMember -Identity $SiteOwnerBaseRole -ErrorAction SilentlyContinue
+    $alreadyMember   = $existingMembers | Where-Object { $_.Name -eq $RoleName }
+
+    if ($alreadyMember) {
+        return "ALREADY_MEMBER"
+    }
+
+    Add-RoleMember -Identity $SiteOwnerBaseRole -Member $RoleName
+    return "ADDED"
+}
+
+
+# ============================================================
+# Optional: queue archive ribbon Read denies (core db) - only when the
+# "Restrict ribbon UI" checkbox is on.
+# ============================================================
+$archiveDenyPermissions = [ordered]@{
+    "item:read" = $true
+}
+
+$ArchiveCommandPaths = @(
+    "core:/sitecore/content/Applications/Content Editor/Ribbons/Chunks/Schedule",
+    "core:/sitecore/content/Applications/Content Editor/Ribbons/Chunks/Schedule/Archive"
+)
+
+function Queue-ArchiveRestrictions {
+    param([string]$RoleName)
+
+    foreach ($archivePath in $ArchiveCommandPaths) {
+        $archiveItem = Get-Item -Path $archivePath -ErrorAction SilentlyContinue
+        if ($archiveItem) {
+            Add-PendingRules -Item $archiveItem -RoleName $RoleName -Permissions $archiveDenyPermissions -PropagationType "Entity" -SecurityPermission "DenyAccess"
+        } else {
+            Write-Host ("[WARN] Archive item not found: " + $archivePath) -ForegroundColor Yellow
+        }
+    }
+}
+
+
+# ============================================================
+# Optional: queue Publish Restrictions UI Read denies (core db) - only when the
+# "Restrict ribbon UI" checkbox is on.
+# ============================================================
+$PublishRestrictionsChunkPath  = "core:/sitecore/content/Applications/Content Editor/Ribbons/Chunks/Publish Restrictions"
+$PublishRestrictionsChangePath = "core:/sitecore/content/Applications/Content Editor/Ribbons/Chunks/Publish Restrictions/Change"
+
+$publishRestrictionsDenyPermissions = [ordered]@{
+    "item:read" = $true
+}
+
+function Queue-PublishRestrictionsPolicy {
+    param([string]$RoleName)
+
+    $publishPaths = @(
+        $PublishRestrictionsChunkPath,
+        $PublishRestrictionsChangePath
+    )
+
+    foreach ($publishPath in $publishPaths) {
+        $publishItem = Get-Item -Path $publishPath -ErrorAction SilentlyContinue
+        if ($publishItem) {
+            Add-PendingRules -Item $publishItem -RoleName $RoleName -Permissions $publishRestrictionsDenyPermissions -PropagationType "Entity" -SecurityPermission "DenyAccess"
+        } else {
+            Write-Host ("[WARN] Publish Restrictions item not found: " + $publishPath) -ForegroundColor Yellow
+        }
+    }
+}
+
+
+# ============================================================
+# Read CSV from a Sitecore media item.
+# Stream and reader are closed in a finally block.
+# ============================================================
+function Read-CsvFromMedia {
+    param([object]$MediaItemOrPath)
+
+    $item = if ($MediaItemOrPath -is [Sitecore.Data.Items.Item]) {
+        $MediaItemOrPath
+    } else {
+        Get-Item -Path $MediaItemOrPath -ErrorAction SilentlyContinue
+    }
+
+    if (-not $item) {
+        Show-Alert "Media item not found."
+        return $null
+    }
+
+    $mediaItem = New-Object Sitecore.Data.Items.MediaItem($item)
+    $stream    = $mediaItem.GetMediaStream()
+
+    if (-not $stream) {
+        Show-Alert "Could not read media stream from: $($item.Paths.FullPath)"
+        return $null
+    }
+
+    $csvText = $null
+    $reader  = New-Object System.IO.StreamReader($stream, [Text.UTF8Encoding]::UTF8)
+    try {
+        $csvText = $reader.ReadToEnd()
+    } finally {
+        $reader.Close()
+        $stream.Close()
+    }
+
+    return ConvertFrom-Csv -InputObject $csvText
+}
+
+
+# ============================================================
+# 1: Dialog - CSV media item picker and run options
+# ============================================================
+$result1 = Read-Variable -Parameters @(
+        @{
+            Name       = "csvMediaItem"
+            Title      = "Site Owner CSV"
+            Editor     = "item"
+            Parameters = @{
+                DatabaseName                 = "master"
+                Root                         = "master:/sitecore/media library"
+                IncludeTemplatesForSelection = "File|Unversioned File"
+                ExcludeTemplatesForSelection = "Media folder"
+                Selection                    = "Single"
+            }
+        },
+        @{
+            Name        = "restrictRibbonUI"
+            Title       = "Restrict ribbon UI (hide Archive + Publish Restrictions)"
+            Tooltip     = "When checked, queues Read denies on core-DB ribbon items so site-owner roles cannot use Archive/Restore or modify Publish Restrictions. Default OFF: site owners get full ribbon access."
+            Editor      = "check"
+            Value       = $false
+        },
+        @{
+            Name        = "dryRun"
+            Title       = "Dry Run (preview only - no changes will be made)"
+            Tooltip     = "When checked, validates rows and shows what would happen without applying any permissions or creating any folders or roles."
+            Editor      = "check"
+            Value       = $true
+        }
+) `
+-Title "Configure Site Owner Permissions" `
+-Description "Two-phase: Phase 1 queues rules, Phase 2 flushes once per item.`nFull edit on microsite + Site Data + media library [site] folder.`nNo Deny rules unless the Restrict ribbon UI checkbox is on." `
+-Width 550 `
+-Height 360 `
+-OkButtonName "Next" `
+-CancelButtonName "Cancel"
+
+if ($result1 -ne "ok") {
+    Show-Alert "Script cancelled by user."
+    return
+}
+
+# Defensive: in some SPE configurations Read-Variable values don't bind cleanly
+# to script scope. If $dryRun ends up $null we treat it as if dry-run is on,
+# rather than risk silent live writes.
+if ($null -eq $dryRun) {
+    Show-Alert "Dry Run setting could not be read from the dialog. Aborting to be safe."
+    return
+}
+$dryRun = [bool]$dryRun
+
+if ($null -eq $restrictRibbonUI) {
+    $restrictRibbonUI = $false
+}
+$restrictRibbonUI = [bool]$restrictRibbonUI
+
+
+# ============================================================
+# 2: Read CSV and detect columns
+# ============================================================
+if (-not $csvMediaItem) {
+    Show-Alert "No CSV file selected. Script cancelled."
+    return
+}
+
+$csvData = Read-CsvFromMedia $csvMediaItem
+
+if (-not $csvData -or $csvData.Count -eq 0) {
+    Show-Alert "CSV file is empty or could not be read."
+    return
+}
+
+$itemPathColumn = $csvData[0].PSObject.Properties.Name | Where-Object { $_ -like "*Item path*" }
+$roleColumn     = $csvData[0].PSObject.Properties.Name | Where-Object { $_ -like "*Role name*" }
+$ownerColumn    = $csvData[0].PSObject.Properties.Name | Where-Object { $_ -like "*author*" -or $_ -like "*owner*" }
+
+if (-not $itemPathColumn -or -not $roleColumn) {
+    Show-Alert "CSV must contain columns matching 'Item path' and 'Role name'.`nFound: $($csvData[0].PSObject.Properties.Name -join ', ')"
+    return
+}
+
+$validRows = $csvData | Where-Object {
+    -not [string]::IsNullOrWhiteSpace($_.$itemPathColumn) -and
+    -not [string]::IsNullOrWhiteSpace($_.$roleColumn)
+}
+
+if ($validRows.Count -eq 0) {
+    Show-Alert "No valid rows found in CSV."
+    return
+}
+
+
+# ============================================================
+# 3: Build permission maps and confirm
+# ============================================================
+# Full edit set for the microsite item, Site Data folder, and media [site] folder.
+# NO Administer.
+$siteOwnerPermissions = [ordered]@{
+    "item:read"   = $true
+    "item:write"  = $true
+    "item:rename" = $true
+    "item:create" = $true
+    "item:delete" = $true
+    "item:admin"  = $false
+}
+
+# Read-only on content-tree ancestors so site owners can navigate down to
+# their microsite from Home.
+$ancestorReadPermissions = [ordered]@{
+    "item:read"   = $true
+    "item:write"  = $false
+    "item:rename" = $false
+    "item:create" = $false
+    "item:delete" = $false
+    "item:admin"  = $false
+}
+
+$ribbonMsg = if ($restrictRibbonUI) { "YES - Archive + Publish Restrictions hidden" } else { "NO - site owners keep full ribbon access" }
+$dryRunMsg = if ($dryRun) { "YES - no changes will be made" } else { "NO - permissions will be applied" }
+
+$confirmMsg = "Rows to process : $($validRows.Count)`nRibbon UI denies: $ribbonMsg`nDry Run         : $dryRunMsg`n`nFor each microsite row, the role gets:`n  - Read/Write/Rename/Create/Delete on the microsite (Entity + Descendants)`n  - Read/Write/Rename/Create/Delete on the Site Data folder (Any propagation)`n  - Read/Write/Rename/Create/Delete on the [site] media folder (Entity + Descendants)`n  - Read on content-tree ancestors up to (not including) Home`n`nNon-site rows will be skipped and logged as NOT_A_SITE.`n`nProceed?"
+
+$confirm = Show-ModalDialog -Control "ConfirmChoice" `
+    -Parameters @{
+        btn_0 = "Yes"
+        btn_1 = "No"
+        te    = $confirmMsg
+        cp    = "Confirm Bulk Site Owner Assignment"
+    } `
+    -Height 320 -Width 700
+
+if ($confirm -ne "btn_0") {
+    Show-Alert "Operation cancelled."
+    return
+}
+
+
+# ============================================================
+# 4: PHASE 1 - process each CSV row, QUEUE rules in memory
+# ============================================================
+$report           = @()
+$totalRows        = $validRows.Count
+$currentRow       = 0
+# $processedRoles tracks which roles have already had ribbon UI denies queued (only used when restrictRibbonUI is on).
+$processedRoles   = [System.Collections.Generic.HashSet[string]]::new()
+
+$eventDisabler = New-Object Sitecore.Data.Events.EventDisabler
+
+try {
+    foreach ($row in $validRows) {
+        $currentRow++
+        Write-Progress -Activity "Phase 1: Queueing ACL rules" `
+                       -Status ("Row " + $currentRow + " of " + $totalRows + " - " + $row.$roleColumn) `
+                       -PercentComplete (($currentRow / $totalRows) * 100)
+
+        $itemPath = $row.$itemPathColumn.Trim()
+        $roleName = ($row.$roleColumn.Trim() -replace "[^\x20-\x7E]", "").Trim()
+        $owner    = if ($ownerColumn) { $row.$ownerColumn } else { "" }
+
+        $reportRow = [PSCustomObject]@{
+            ItemPath    = $itemPath
+            Role        = $roleName
+            Owner       = $owner
+            Status      = ""
+            MediaFolder = ""
+            Notes       = ""
+        }
+
+        # Ensure the role exists and is in Site Owner Base (live mode only - dry-run reports state).
+        if ($dryRun) {
+            $role            = Get-Role -Identity $roleName -ErrorAction SilentlyContinue
+            $existingMembers = if ($role) { Get-RoleMember -Identity $SiteOwnerBaseRole -ErrorAction SilentlyContinue } else { @() }
+            $alreadyMember   = $existingMembers | Where-Object { $_.Name -eq $roleName }
+            if (-not $role) {
+                $reportRow.Notes += "Role does not exist - would be created with base role | "
+            } elseif ($alreadyMember) {
+                $reportRow.Notes += "Base role already assigned | "
+            } else {
+                $reportRow.Notes += "Base role would be assigned | "
+            }
+        } else {
+            $baseRoleResult = Ensure-SiteOwnerBaseRole -RoleName $roleName
+            $noteMsg = switch ($baseRoleResult) {
+                "CREATED"        { "Role created + base role assigned | " }
+                "ADDED"          { "Base role assigned | " }
+                "ALREADY_MEMBER" { "Base role already set | " }
+                default          { "Base role result: $baseRoleResult | " }
+            }
+            $reportRow.Notes += $noteMsg
+        }
+
+        # Resolve Sitecore item path to SPE provider path
+        $scPath = $itemPath -replace "^/sitecore", "master:"
+        $scPath = $scPath -replace "/", "\"
+        $foundItem = Get-Item -Path $scPath -ErrorAction SilentlyContinue
+
+        if (-not $foundItem) {
+            $reportRow.Status = "MISSING_ITEM"
+            $reportRow.Notes  = "Item not found at path: $itemPath"
+            $report += $reportRow
+            continue
+        }
+
+        # Validate that the resolved item is actually a microsite.
+        # Per requirement: log non-site rows and skip them; do NOT walk up to find a site.
+        if (-not (Test-IsAscensionSite -Item $foundItem)) {
+            $reportRow.Status = "NOT_A_SITE"
+            $reportRow.Notes  = "Resolved item is not an _AscensionSite. Template: " + $foundItem.TemplateName + " | Path: " + $foundItem.Paths.FullPath
+            $report += $reportRow
+            continue
+        }
+
+        $matchingSite = $foundItem
+        $reportRow.Notes += "Site validated: " + $matchingSite.Name + " | "
+
+        # ---- Queue microsite item permissions ----
+        # Two rules: Entity on the site item, Descendants for its children.
+        Add-PendingRules -Item $matchingSite -RoleName $roleName -Permissions $siteOwnerPermissions -PropagationType "Entity"
+        Add-PendingRules -Item $matchingSite -RoleName $roleName -Permissions $siteOwnerPermissions -PropagationType "Descendants"
+        $reportRow.Notes += "Site permissions queued (Entity + Descendants) | "
+
+        # ---- Queue ancestor Read on content tree ----
+        # Walk from microsite parent up to (not including) Home.
+        $ancestorItem  = $matchingSite.Parent
+        $ancestorNames = @()
+        while ($ancestorItem -and `
+               $ancestorItem.Paths.FullPath -ne $homeContentPath -and `
+               $ancestorItem.ID -ne [Sitecore.Data.ID]::Parse("{11111111-1111-1111-1111-111111111111}")) {
+            Add-PendingRules -Item $ancestorItem -RoleName $roleName -Permissions $ancestorReadPermissions -PropagationType "Entity"
+            $ancestorNames += $ancestorItem.Name
+            $ancestorItem = $ancestorItem.Parent
+        }
+        if ($ancestorNames.Count -gt 0) {
+            $reportRow.Notes += "Ancestor Read queued: " + ($ancestorNames -join " > ") + " | "
+        }
+
+        # ---- Queue Site Data folder ----
+        # Find by Ascension Site Data template ID - name varies per site.
+        $siteDataItem = $matchingSite.Children | Where-Object {
+            $_.TemplateID.ToString() -eq $AscensionSiteDataTemplateId
+        } | Select-Object -First 1
+
+        if ($siteDataItem) {
+            Add-PendingRules -Item $siteDataItem -RoleName $roleName -Permissions $siteOwnerPermissions -PropagationType "Any"
+            $reportRow.Notes += "Site Data (" + $siteDataItem.Name + ") queued | "
+        } else {
+            $reportRow.Notes += "Site Data folder not found under: " + $matchingSite.Name + " | "
+        }
+
+        # ---- Queue media library [site] folder ----
+        # Path under DFD media root. Full perms on item + descendants. Covers the entire
+        # site's media tree including any per-page subfolders other roles might also use.
+        $siteName       = $matchingSite.Name
+        $mediaSitePath  = "$MediaLibraryRoot/$siteName"
+        $mediaSiteItem  = Get-Item -Path $mediaSitePath -ErrorAction SilentlyContinue
+
+        if ($mediaSiteItem) {
+            $reportRow.MediaFolder = "/sitecore/media library/Project/Intranet Evolution/DFD/$siteName"
+            Add-PendingRules -Item $mediaSiteItem -RoleName $roleName -Permissions $siteOwnerPermissions -PropagationType "Entity"
+            Add-PendingRules -Item $mediaSiteItem -RoleName $roleName -Permissions $siteOwnerPermissions -PropagationType "Descendants"
+            $reportRow.Notes += "Media [site] folder queued (Entity + Descendants) | "
+        } else {
+            $reportRow.MediaFolder = "/sitecore/media library/Project/Intranet Evolution/DFD/$siteName"
+            $reportRow.Notes += "Media [site] folder not found at: $mediaSitePath | "
+        }
+
+        # ---- Optional: ribbon UI denies (per-role one-time) ----
+        if ($restrictRibbonUI -and -not $processedRoles.Contains($roleName)) {
+            Queue-ArchiveRestrictions -RoleName $roleName
+            Queue-PublishRestrictionsPolicy -RoleName $roleName
+            $processedRoles.Add($roleName) | Out-Null
+            $reportRow.Notes += "Ribbon UI denies queued | "
+        }
+
+        $reportRow.Status = if ($dryRun) { "DRY_RUN" } else { "PERMISSIONS_QUEUED" }
+        $report += $reportRow
+    }
+
+    Write-Progress -Activity "Phase 1: Queueing ACL rules" -Completed
+
+
+    # ============================================================
+    # 5: PHASE 2 - flush the queue
+    # ============================================================
+    $flushReport       = @()
+    $totalItemsToFlush = $aclQueue.Keys.Count
+    $flushIndex        = 0
+    $flushOk           = 0
+    $flushFailed       = 0
+    $flushSkippedDry   = 0
+
+    Write-Host ("Phase 2: " + $totalItemsToFlush + " unique items to flush.") -ForegroundColor Cyan
+
+    $keysToFlush = @($aclQueue.Keys)
+
+    foreach ($key in $keysToFlush) {
+        $flushIndex++
+        $itemMeta     = $aclItems[$key]
+        $providerPath = $itemMeta.Database + ":" + $itemMeta.Path
+        $newRules     = $aclQueue[$key]
+
+        Write-Progress -Activity "Phase 2: Flushing ACLs" `
+                       -Status ($flushIndex.ToString() + " of " + $totalItemsToFlush + " - " + $itemMeta.Path) `
+                       -PercentComplete (($flushIndex / [Math]::Max(1, $totalItemsToFlush)) * 100)
+
+        $flushRow = [PSCustomObject]@{
+            ItemPath    = $providerPath
+            QueuedRules = $newRules.Count
+            FinalRules  = ""
+            Status      = ""
+            Notes       = ""
+        }
+
+        if ($dryRun) {
+            $flushRow.Status = "DRY_RUN"
+            $flushRow.Notes  = "Would write " + $newRules.Count + " queued rule(s) plus existing ACL"
+            $flushSkippedDry++
+            $flushReport += $flushRow
+            continue
+        }
+
+        try {
+            $freshItem = Get-Item -Path $providerPath -ErrorAction Stop
+            $existing  = @(Get-ItemAcl -Item $freshItem)
+            $allRules  = $existing + @($newRules)
+            Set-ItemAcl -Item $freshItem -AccessRules $allRules | Out-Null
+
+            $flushRow.Status     = "FLUSHED"
+            $flushRow.FinalRules = $allRules.Count
+            $flushRow.Notes      = "existing=" + $existing.Count + " queued=" + $newRules.Count + " final=" + $allRules.Count
+            $flushOk++
+        } catch {
+            $flushRow.Status = "FLUSH_ERROR"
+            $flushRow.Notes  = $_.Exception.Message
+            $flushFailed++
+        }
+
+        $flushReport += $flushRow
+    }
+
+    Write-Progress -Activity "Phase 2: Flushing ACLs" -Completed
+} finally {
+    $eventDisabler.Dispose()
+}
+
+
+# ============================================================
+# 6: Output reports - Phase 1 row-level + Phase 2 flush summary
+# ============================================================
+$reportTitle = if ($dryRun) { "Bulk Site Owner Report (DRY RUN) - Phase 1: Rows" } else { "Bulk Site Owner Report - Phase 1: Rows" }
+$infoTitle   = if ($dryRun) { "DRY RUN - " + $report.Count + " rows previewed" } else { "Phase 1: " + $report.Count + " rows processed (queueing only)" }
+
+$report | Show-ListView `
+    -Property `
+        @{ Label = "Status";       Expression = { $_.Status } },
+        @{ Label = "Item Path";    Expression = { $_.ItemPath } },
+        @{ Label = "Role";         Expression = { $_.Role } },
+        @{ Label = "Owner";        Expression = { $_.Owner } },
+        @{ Label = "Media Folder"; Expression = { $_.MediaFolder } },
+        @{ Label = "Notes";        Expression = { $_.Notes } } `
+    -Title $reportTitle `
+    -InfoTitle $infoTitle `
+    -PageSize 50
+
+$flushTitle = if ($dryRun) { "Phase 2: Flush Plan (DRY RUN)" } else { "Phase 2: Flush Results" }
+$flushInfo  = if ($dryRun) {
+    "DRY RUN - " + $flushSkippedDry + " items would be flushed, no writes made"
+} else {
+    "Flushed: " + $flushOk + " | Failed: " + $flushFailed + " | Total items: " + $flushReport.Count
+}
+
+$flushReport | Show-ListView `
+    -Property `
+        @{ Label = "Status";       Expression = { $_.Status } },
+        @{ Label = "Item Path";    Expression = { $_.ItemPath } },
+        @{ Label = "Queued Rules"; Expression = { $_.QueuedRules } },
+        @{ Label = "Final Rules";  Expression = { $_.FinalRules } },
+        @{ Label = "Notes";        Expression = { $_.Notes } } `
+    -Title $flushTitle `
+    -InfoTitle $flushInfo `
+    -PageSize 50
+
+# Phase 1 status counts
+$queued      = ($report | Where-Object { $_.Status -eq "PERMISSIONS_QUEUED" }).Count
+$dryRunRows  = ($report | Where-Object { $_.Status -eq "DRY_RUN"            }).Count
+$missing     = ($report | Where-Object { $_.Status -eq "MISSING_ITEM"       }).Count
+$notSite     = ($report | Where-Object { $_.Status -eq "NOT_A_SITE"         }).Count
+
+if ($dryRun) {
+    Write-Host ("DRY RUN complete. DRY_RUN: " + $dryRunRows + " | MISSING_ITEM: " + $missing + " | NOT_A_SITE: " + $notSite + " | Phase 2 items that would be flushed: " + $flushSkippedDry) -ForegroundColor Yellow
+} else {
+    Write-Host ("Done. QUEUED: " + $queued + " | MISSING_ITEM: " + $missing + " | NOT_A_SITE: " + $notSite + " | FLUSHED: " + $flushOk + " | FAILED: " + $flushFailed) -ForegroundColor Green
+}
