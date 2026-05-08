@@ -1,0 +1,226 @@
+<#
+Purpose:
+Read a CSV file from the Sitecore Media Library, find Sitecore users by username,
+and enable the account if it is disabled.
+#>
+
+$results = New-Object System.Collections.Generic.List[object]
+
+# -----------------------------
+# Select CSV and options
+# -----------------------------
+
+$DryRun = $true
+
+$result = Read-Variable `
+    -Parameters @(
+        @{
+            Name = "CsvMediaItem"
+            Title = "Select Disabled Users CSV from Media Library"
+            Source = "/sitecore/media library"
+            Editor = "droptree"
+            Tooltip = "Select the CSV file that contains IsEnabled and Name columns."
+        },
+        @{
+            Name = "DryRun"
+            Title = "Dry Run"
+            Value = $true
+            Editor = "checkbox"
+            Tooltip = "Checked = preview only. Unchecked = enable disabled users."
+        }
+    ) `
+    -Description "Pick the disabled users CSV file from the Media Library and choose whether to run in dry-run mode." `
+    -Title "Enable Disabled Users From CSV" `
+    -Width 600 `
+    -Height 400 `
+    -OkButtonName "Run"
+
+if ($result -ne "ok") {
+    Write-Host "Script cancelled by user." -ForegroundColor Yellow
+    return
+}
+
+if ($null -eq $CsvMediaItem) {
+    Write-Host "No CSV media item selected." -ForegroundColor Red
+    return
+}
+
+$dryRun = [System.Convert]::ToBoolean($DryRun)
+
+# -----------------------------
+# Read CSV content from media
+# -----------------------------
+
+try {
+    $mediaItem = [Sitecore.Data.Items.MediaItem]$CsvMediaItem
+    $media = [Sitecore.Resources.Media.MediaManager]::GetMedia($mediaItem)
+
+    if ($null -eq $media) {
+        Write-Host "Unable to read the selected media item." -ForegroundColor Red
+        return
+    }
+
+    $mediaStream = $media.GetStream()
+
+    if ($null -eq $mediaStream -or $null -eq $mediaStream.Stream) {
+        Write-Host "Selected media item does not contain a valid file stream." -ForegroundColor Red
+        return
+    }
+
+    $stream = $mediaStream.Stream
+
+    try {
+        $reader = New-Object System.IO.StreamReader($stream)
+        $csvContent = $reader.ReadToEnd()
+    }
+    finally {
+        if ($reader) {
+            $reader.Close()
+        }
+
+        if ($stream) {
+            $stream.Close()
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($csvContent)) {
+        Write-Host "Selected CSV file is empty." -ForegroundColor Red
+        return
+    }
+
+    $rows = $csvContent | ConvertFrom-Csv
+}
+catch {
+    Write-Host "Error reading CSV from Media Library: $($_.Exception.Message)" -ForegroundColor Red
+    return
+}
+
+if ($null -eq $rows -or $rows.Count -eq 0) {
+    Write-Host "No rows found in the selected CSV file." -ForegroundColor Red
+    return
+}
+
+# -----------------------------
+# Validate CSV columns
+# -----------------------------
+
+$firstRow = $rows | Select-Object -First 1
+$columnNames = $firstRow.PSObject.Properties.Name
+
+if (-not ($columnNames -contains "Name")) {
+    Write-Host "CSV must contain a column named Name." -ForegroundColor Red
+    return
+}
+
+# -----------------------------
+# Process users
+# -----------------------------
+
+foreach ($row in $rows) {
+
+    $csvIsEnabled = ""
+    $userName = $row.Name
+
+    if ($columnNames -contains "IsEnabled") {
+        $csvIsEnabled = $row.IsEnabled
+    }
+
+    if ([string]::IsNullOrWhiteSpace($userName)) {
+        $results.Add([pscustomobject]@{
+            CsvIsEnabled = $csvIsEnabled
+            UserName     = ""
+            Found        = $false
+            WasDisabled  = ""
+            Action       = "Skipped"
+            Message      = "Missing username in Name column"
+        })
+
+        continue
+    }
+
+    $userName = $userName.Trim()
+
+    try {
+        $membershipUser = [System.Web.Security.Membership]::GetUser($userName)
+
+        if ($null -eq $membershipUser) {
+            $results.Add([pscustomobject]@{
+                CsvIsEnabled = $csvIsEnabled
+                UserName     = $userName
+                Found        = $false
+                WasDisabled  = ""
+                Action       = "No change"
+                Message      = "No Sitecore user found with this username"
+            })
+
+            continue
+        }
+
+        # In Sitecore, disabled users are commonly represented by IsApproved = false
+        $isDisabled = -not $membershipUser.IsApproved
+
+        if ($isDisabled) {
+
+            if (-not $dryRun) {
+                $membershipUser.IsApproved = $true
+                [System.Web.Security.Membership]::UpdateUser($membershipUser)
+            }
+
+            $results.Add([pscustomobject]@{
+                CsvIsEnabled = $csvIsEnabled
+                UserName     = $userName
+                Found        = $true
+                WasDisabled  = $true
+                Action       = if ($dryRun) { "Would enable" } else { "Enabled" }
+                Message      = "User account was disabled"
+            })
+        }
+        else {
+            $results.Add([pscustomobject]@{
+                CsvIsEnabled = $csvIsEnabled
+                UserName     = $userName
+                Found        = $true
+                WasDisabled  = $false
+                Action       = "No change"
+                Message      = "User account is already enabled"
+            })
+        }
+    }
+    catch {
+        $results.Add([pscustomobject]@{
+            CsvIsEnabled = $csvIsEnabled
+            UserName     = $userName
+            Found        = ""
+            WasDisabled  = ""
+            Action       = "Error"
+            Message      = $_.Exception.Message
+        })
+    }
+}
+
+# -----------------------------
+# Show report
+# -----------------------------
+
+$title = "Enable Disabled Users Report"
+
+$infoTitle = if ($dryRun) {
+    "Disabled User Account Enablement - Dry Run"
+}
+else {
+    "Disabled User Account Enablement - Applied"
+}
+
+$results | Show-ListView `
+    -Property `
+        @{ Label = "CSV IsEnabled"; Expression = { $_.CsvIsEnabled } },
+        @{ Label = "User"; Expression = { $_.UserName } },
+        @{ Label = "Found"; Expression = { $_.Found } },
+        @{ Label = "Was Disabled"; Expression = { $_.WasDisabled } },
+        @{ Label = "Status"; Expression = { $_.Action } },
+        @{ Label = "Notes"; Expression = { $_.Message } } `
+    -Title $title `
+    -InfoTitle $infoTitle `
+    -InfoDescription "Processed $($results.Count) result rows. Dry Run: $dryRun" `
+    -PageSize 50
+    
