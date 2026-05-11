@@ -1,0 +1,298 @@
+# Cleanup incorrectly-created media folders directly under site media folders.
+# Reads SitePath values from a CSV, finds matching media folders, and deletes empty
+# direct child folders that are not "pages" or "news". Supports Dry Run.
+
+# -------------------------
+# Helper Functions
+# -------------------------
+
+function Resolve-MediaSiteFolderPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SitePath
+    )
+
+    # Input:  /sitecore/content/Intranet Evolution/DFD/Home/clinicalservices
+    # Output: /sitecore/media library/Project/Intranet Evolution/DFD/clinicalservices
+    #
+    # Split positions after TrimStart("/"):
+    #   [0] sitecore
+    #   [1] content
+    #   [2] tenant name       e.g. "Intranet Evolution"
+    #   [3] site collection   e.g. "DFD"
+    #   [4] Home
+    #   [5] site name         e.g. "clinicalservices"
+    #
+    # Sitecore paths use "/" as the sole delimiter, so splitting on "/"
+    # handles multi-word segment names (e.g. "Intranet Evolution") correctly.
+
+    $cleanPath = $SitePath.Trim().TrimStart("/")
+
+    if ([string]::IsNullOrWhiteSpace($cleanPath)) {
+        return $null
+    }
+
+    $parts = $cleanPath -split "/"
+
+    # Require at least 6 segments
+    if ($parts.Count -lt 6) {
+        return $null
+    }
+
+    $tenantName         = $parts[2]
+    $siteCollectionName = $parts[3]
+    $siteName           = $parts[5]
+
+    return "/sitecore/media library/Project/$tenantName/$siteCollectionName/$siteName"
+}
+
+function Get-CsvTextFromMediaItem {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Sitecore.Data.Items.Item]$MediaItem
+    )
+
+    $mediaItem2 = [Sitecore.Data.Items.MediaItem]$MediaItem
+    $stream = $mediaItem2.GetMediaStream()
+
+    if ($null -eq $stream) {
+        throw "Could not open media stream for: $($MediaItem.Paths.FullPath)"
+    }
+
+    try {
+        $reader = New-Object System.IO.StreamReader($stream)
+        return $reader.ReadToEnd()
+    }
+    finally {
+        if ($null -ne $reader) { $reader.Dispose() }
+        $stream.Dispose()
+    }
+}
+
+# -------------------------
+# Dialog: CSV picker + Dry Run checkbox in one Read-Variable call
+# -------------------------
+
+$dialogResult = Read-Variable `
+    -Parameters @(
+        @{
+            Name    = "CsvMediaItem"
+            Title   = "CSV File (Media Library)"
+            Source  = "DataSource=/sitecore/media library&DatabaseName=master"
+            Editor  = "droptree"
+            Tooltip = "Select the CSV file uploaded to the Media Library."
+        },
+        @{
+            Name    = "DryRun"
+            Title   = "Dry Run Only"
+            Value   = $true
+            Editor  = "checkbox"
+            Tooltip = "When checked, no items will be deleted."
+        }
+    ) `
+    -Title            "Cleanup Empty Media Folders" `
+    -Description      "Removes empty direct-child folders under site media folders that are not 'pages' or 'news'." `
+    -Width            600 `
+    -Height           350 `
+    -OkButtonName     "Run" `
+    -CancelButtonName "Cancel"
+
+if ($dialogResult -ne "ok") {
+    Show-Alert "Script cancelled."
+    return
+}
+
+if ($null -eq $CsvMediaItem) {
+    Show-Alert "No CSV file was selected. Script cancelled."
+    return
+}
+
+# -------------------------
+# Read and parse CSV
+# -------------------------
+
+$csvText = $null
+
+try {
+    $csvText = Get-CsvTextFromMediaItem -MediaItem $CsvMediaItem
+}
+catch {
+    Show-Alert "Failed to read CSV from Media Library. Error: $($_.Exception.Message)"
+    return
+}
+
+# Wrap in @() so a single-row CSV still has a reliable .Count
+$csvRows = @($csvText | ConvertFrom-Csv)
+
+if ($csvRows.Count -eq 0) {
+    Show-Alert "The CSV file contains no data rows."
+    return
+}
+
+# -------------------------
+# Constants
+# -------------------------
+
+$mediaFolderTemplateId = "{FE5DD826-48C6-436D-B87A-7C4210C7413B}"
+$allowedFolderNames    = @("pages", "news")
+
+$report = New-Object System.Collections.Generic.List[object]
+
+# -------------------------
+# Process each CSV row
+# -------------------------
+
+foreach ($row in $csvRows) {
+
+    $sitePath = if ($null -ne $row.SitePath) { $row.SitePath.Trim() } else { "" }
+
+    if ([string]::IsNullOrWhiteSpace($sitePath)) {
+        $report.Add([pscustomobject]@{
+            SitePath      = "(empty)"
+            MediaFolder   = ""
+            CheckedFolder = ""
+            Status        = "Skipped"
+            Notes         = "Row has no SitePath value."
+        })
+        continue
+    }
+
+    # Derive media folder path from content path
+    $mediaFolderPath = Resolve-MediaSiteFolderPath -SitePath $sitePath
+
+    if ([string]::IsNullOrWhiteSpace($mediaFolderPath)) {
+        $report.Add([pscustomobject]@{
+            SitePath      = $sitePath
+            MediaFolder   = ""
+            CheckedFolder = ""
+            Status        = "Skipped"
+            Notes         = "Could not resolve media folder path. Check SitePath format."
+        })
+        continue
+    }
+
+    # Resolve media folder item from master database
+    $mediaSiteFolder = Get-Item -Path "master:$mediaFolderPath" -ErrorAction SilentlyContinue
+
+    if ($null -eq $mediaSiteFolder) {
+        $report.Add([pscustomobject]@{
+            SitePath      = $sitePath
+            MediaFolder   = $mediaFolderPath
+            CheckedFolder = ""
+            Status        = "Not Found"
+            Notes         = "Media site folder does not exist in Sitecore."
+        })
+        continue
+    }
+
+    # Collect only direct child Media Folder template items
+    $childFolders = @(
+        $mediaSiteFolder.Children | Where-Object {
+            $_.TemplateID.ToString() -eq $mediaFolderTemplateId
+        }
+    )
+
+    if ($childFolders.Count -eq 0) {
+        $report.Add([pscustomobject]@{
+            SitePath      = $sitePath
+            MediaFolder   = $mediaSiteFolder.Paths.FullPath
+            CheckedFolder = ""
+            Status        = "No Folders"
+            Notes         = "No direct child media folders found under this site media folder."
+        })
+        continue
+    }
+
+    foreach ($folder in $childFolders) {
+
+        $folderName = $folder.Name.ToLowerInvariant()
+
+        # Always skip pages and news - never touch them
+        if ($allowedFolderNames -contains $folderName) {
+            $report.Add([pscustomobject]@{
+                SitePath      = $sitePath
+                MediaFolder   = $mediaSiteFolder.Paths.FullPath
+                CheckedFolder = $folder.Paths.FullPath
+                Status        = "Skipped"
+                Notes         = "Protected folder ('$folderName'). Not eligible for deletion."
+            })
+            continue
+        }
+
+        # Skip non-empty folders
+        if ($folder.Children.Count -gt 0) {
+            $report.Add([pscustomobject]@{
+                SitePath      = $sitePath
+                MediaFolder   = $mediaSiteFolder.Paths.FullPath
+                CheckedFolder = $folder.Paths.FullPath
+                Status        = "Skipped"
+                Notes         = "Folder has $($folder.Children.Count) child item(s). Not deleted."
+            })
+            continue
+        }
+
+        # Empty folder outside pages/news - candidate for deletion
+        if ($DryRun) {
+            $report.Add([pscustomobject]@{
+                SitePath      = $sitePath
+                MediaFolder   = $mediaSiteFolder.Paths.FullPath
+                CheckedFolder = $folder.Paths.FullPath
+                Status        = "Dry Run"
+                Notes         = "Empty folder would be deleted (Dry Run active)."
+            })
+            continue
+        }
+
+        # Live deletion via Sitecore API
+        # .Recycle() sends the item to the Recycle Bin (recoverable).
+        # Switch to .Delete() only if you want a permanent hard delete.
+        try {
+            $folder.Recycle() | Out-Null
+
+            $report.Add([pscustomobject]@{
+                SitePath      = $sitePath
+                MediaFolder   = $mediaSiteFolder.Paths.FullPath
+                CheckedFolder = $folder.Paths.FullPath
+                Status        = "Deleted"
+                Notes         = "Empty folder recycled successfully."
+            })
+        }
+        catch {
+            $report.Add([pscustomobject]@{
+                SitePath      = $sitePath
+                MediaFolder   = $mediaSiteFolder.Paths.FullPath
+                CheckedFolder = $folder.Paths.FullPath
+                Status        = "Error"
+                Notes         = $_.Exception.Message
+            })
+        }
+    }
+}
+
+# -------------------------
+# Report
+# -------------------------
+
+$title = if ($DryRun) {
+    "Dry Run - Empty Media Folder Cleanup"
+} else {
+    "Empty Media Folder Cleanup"
+}
+
+$infoTitle = if ($DryRun) {
+    "Dry run complete. No items were deleted."
+} else {
+    "Cleanup complete."
+}
+
+$report | Show-ListView `
+    -Property `
+        @{ Label = "Site Path";      Expression = { $_.SitePath } },
+        @{ Label = "Media Folder";   Expression = { $_.MediaFolder } },
+        @{ Label = "Checked Folder"; Expression = { $_.CheckedFolder } },
+        @{ Label = "Status";         Expression = { $_.Status } },
+        @{ Label = "Notes";          Expression = { $_.Notes } } `
+    -Title           $title `
+    -InfoTitle       $infoTitle `
+    -InfoDescription "Processed $($report.Count) folder checks." `
+    -PageSize        100
