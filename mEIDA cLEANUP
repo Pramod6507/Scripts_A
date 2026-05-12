@@ -205,14 +205,15 @@ foreach ($row in $csvRows) {
 
     foreach ($folder in $childFolders) {
 
-        $folderName = $folder.Name.ToLowerInvariant()
+        $folderName     = $folder.Name.ToLowerInvariant()
+        $folderFullPath = $folder.Paths.FullPath
 
         # Always skip pages and news - never touch them
         if ($allowedFolderNames -contains $folderName) {
             $report.Add([pscustomobject]@{
                 SitePath      = $sitePath
                 MediaFolder   = $mediaSiteFolder.Paths.FullPath
-                CheckedFolder = $folder.Paths.FullPath
+                CheckedFolder = $folderFullPath
                 Status        = "Skipped"
                 Notes         = "Protected folder ('$folderName'). Not eligible for deletion."
             })
@@ -224,7 +225,7 @@ foreach ($row in $csvRows) {
             $report.Add([pscustomobject]@{
                 SitePath      = $sitePath
                 MediaFolder   = $mediaSiteFolder.Paths.FullPath
-                CheckedFolder = $folder.Paths.FullPath
+                CheckedFolder = $folderFullPath
                 Status        = "Skipped"
                 Notes         = "Folder has $($folder.Children.Count) child item(s). Not deleted."
             })
@@ -236,14 +237,14 @@ foreach ($row in $csvRows) {
             $report.Add([pscustomobject]@{
                 SitePath      = $sitePath
                 MediaFolder   = $mediaSiteFolder.Paths.FullPath
-                CheckedFolder = $folder.Paths.FullPath
+                CheckedFolder = $folderFullPath
                 Status        = "Dry Run"
                 Notes         = "Empty folder would be deleted (Dry Run active)."
             })
             continue
         }
 
-        # Live deletion via Sitecore API
+        # Capture full path before recycling - path becomes unresolvable after Recycle()
         # .Recycle() sends the item to the Recycle Bin (recoverable).
         # Switch to .Delete() only if you want a permanent hard delete.
         try {
@@ -252,7 +253,7 @@ foreach ($row in $csvRows) {
             $report.Add([pscustomobject]@{
                 SitePath      = $sitePath
                 MediaFolder   = $mediaSiteFolder.Paths.FullPath
-                CheckedFolder = $folder.Paths.FullPath
+                CheckedFolder = $folderFullPath
                 Status        = "Deleted"
                 Notes         = "Empty folder recycled successfully."
             })
@@ -261,7 +262,7 @@ foreach ($row in $csvRows) {
             $report.Add([pscustomobject]@{
                 SitePath      = $sitePath
                 MediaFolder   = $mediaSiteFolder.Paths.FullPath
-                CheckedFolder = $folder.Paths.FullPath
+                CheckedFolder = $folderFullPath
                 Status        = "Error"
                 Notes         = $_.Exception.Message
             })
