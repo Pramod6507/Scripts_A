@@ -1,0 +1,54 @@
+# Exports direct child site paths under /sitecore/content/Intranet Evolution/DFD/Home
+# as a CSV with a single SitePath column, ready for use with CleanupEmptyMediaFolders.ps1.
+# Shows results in a Show-ListView grid and offers the file as a browser download.
+
+# -------------------------
+# Configuration
+# -------------------------
+
+$homePath = "/sitecore/content/Intranet Evolution/DFD/Home"
+
+# -------------------------
+# Get direct children of Home
+# -------------------------
+
+$homeItem = Get-Item -Path "master:$homePath" -ErrorAction SilentlyContinue
+
+if ($null -eq $homeItem) {
+    Show-Alert "Home item not found at: $homePath"
+    return
+}
+
+$siteItems = @($homeItem.Children)
+
+if ($siteItems.Count -eq 0) {
+    Show-Alert "No child items found under: $homePath"
+    return
+}
+
+# -------------------------
+# Build report rows and CSV lines together
+# -------------------------
+
+$report = New-Object System.Collections.Generic.List[object]
+
+foreach ($site in $siteItems) {
+    $fullPath = $site.Paths.FullPath
+    $report.Add([pscustomobject]@{
+        SiteName = $site.Name
+        SitePath = $fullPath
+    })
+}
+
+# -------------------------
+# Show-ListView grid
+# -------------------------
+
+$report | Show-ListView `
+    -Property `
+        @{ Label = "SiteName"; Expression = { $_.SiteName } },
+        @{ Label = "SitePath"; Expression = { $_.SitePath } } `
+    -Title           "Site Path Export" `
+    -InfoTitle       "Export complete. $($report.Count) site(s) found." `
+    -InfoDescription "Use these paths as input for CleanupEmptyMediaFolders.ps1." `
+    -PageSize        100
