@@ -130,7 +130,7 @@ function Ensure-SiteOwnerBaseRole {
     }
 
     $existingMembers = Get-RoleMember -Identity $SiteOwnerBaseRole -ErrorAction SilentlyContinue
-    $alreadyMember   = $existingMembers | Where-Object { $_.Name -eq $RoleName }
+    $alreadyMember   = $existingMembers | Where-Object { $_.Name -eq $roleName }
 
     if ($alreadyMember) {
         return "ALREADY_MEMBER"
@@ -490,18 +490,36 @@ try {
         # ---- Queue media library [site] folder ----
         # Path under DFD media root. Full perms on item + descendants. Covers the entire
         # site's media tree including any per-page subfolders other roles might also use.
-        $siteName       = $matchingSite.Name
-        $mediaSitePath  = "$MediaLibraryRoot/$siteName"
-        $mediaSiteItem  = Get-Item -Path $mediaSitePath -ErrorAction SilentlyContinue
+        # If the content path contains "Collaboration Sites", mirror that segment in the media path.
+        $siteName      = $matchingSite.Name
+        $mediaParent   = if ($itemPath -like "*Collaboration Sites*") { "$MediaLibraryRoot/Collaboration Sites" } else { $MediaLibraryRoot }
+        $mediaSitePath = "$mediaParent/$siteName"
+
+        $mediaSiteItem = Get-Item -Path $mediaSitePath -ErrorAction SilentlyContinue
 
         if ($mediaSiteItem) {
-            $reportRow.MediaFolder = "/sitecore/media library/Project/Intranet Evolution/DFD/$siteName"
+            $reportRow.MediaFolder = $mediaSitePath -replace "^master:", ""
             Add-PendingRules -Item $mediaSiteItem -RoleName $roleName -Permissions $siteOwnerPermissions -PropagationType "Entity"
             Add-PendingRules -Item $mediaSiteItem -RoleName $roleName -Permissions $siteOwnerPermissions -PropagationType "Descendants"
             $reportRow.Notes += "Media [site] folder queued (Entity + Descendants) | "
         } else {
-            $reportRow.MediaFolder = "/sitecore/media library/Project/Intranet Evolution/DFD/$siteName"
-            $reportRow.Notes += "Media [site] folder not found at: $mediaSitePath | "
+            $reportRow.MediaFolder = $mediaSitePath -replace "^master:", ""
+
+            if ($dryRun) {
+                # Dry-run: preview only. Don't create the folder; just note it would be.
+                $reportRow.Notes += "Media [site] folder would be created at: $mediaSitePath | "
+            } else {
+                # Live: create the folder under the appropriate media parent using the Media folder template.
+                try {
+                    $mediaSiteItem = New-Item -Path $mediaParent -Name $siteName -ItemType "System/Media/Media folder" -ErrorAction Stop
+                    Write-Host ("[CREATED] " + $mediaSitePath) -ForegroundColor Green
+                    Add-PendingRules -Item $mediaSiteItem -RoleName $roleName -Permissions $siteOwnerPermissions -PropagationType "Entity"
+                    Add-PendingRules -Item $mediaSiteItem -RoleName $roleName -Permissions $siteOwnerPermissions -PropagationType "Descendants"
+                    $reportRow.Notes += "Media [site] folder created + queued (Entity + Descendants) | "
+                } catch {
+                    $reportRow.Notes += "Media [site] folder creation failed at $mediaSitePath`: $($_.Exception.Message) | "
+                }
+            }
         }
 
         # ---- Optional: ribbon UI denies (per-role one-time) ----
