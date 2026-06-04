@@ -68,17 +68,13 @@ function New-SitecoreUserFromEmail {
     $newUser = New-User -Identity $userName `
                         -Email $Email `
                         -Password ([System.Guid]::NewGuid().ToString() + "!Aa1") `
+                        -Enabled `
                         -ErrorAction Stop
 
-    # Enable the account
-    $newUser.Enabled = $true
+    Enable-User -Identity $userName
 
     # Set profile fields - useful for any tools that rely on profile email later
-    $profile = Get-UserProfile -Identity $userName
-    $profile.Email    = $Email
-    $profile.FullName = "$firstName $lastName".Trim()
-    $profile.Save()
-
+    Set-User -Identity $userName -Email $Email -FullName "$firstName $lastName".Trim()
     return $newUser
 }
 
